@@ -58,9 +58,9 @@ from the repository root (the store requires `manifest.json` at the root of the 
   icon looks cramped in the store.
 - Small promo tile (required, 440×280): `store/promo-small-440x280.png`.
 - Screenshots (at least one; 1280×800 preferred, or 640×400; PNG or JPEG; full bleed, square
-  corners): take them from a real watch page, e.g. (1) the player with the panel switched on and
-  the seek bar showing green, (2) the panel while processing, (3) the transpose stepper in use.
-  Any window screenshot can be cropped or scaled to exactly 1280×800 afterwards.
+  corners): `store/screenshot-1-1280x800.png` (the watch page with the panel switched on, mid
+  processing) and `store/screenshot-2-1280x800.png` (the panel up close, with a caption). Both were
+  made from real screenshots; the originals are not committed. Upload them in that order.
 - Marquee tile (optional, 1400×560): not provided.
 
 ## Privacy practices tab
