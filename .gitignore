@@ -5,3 +5,6 @@
 .claude/
 node_modules/
 *.log
+
+# store packages built locally
+dist/
