@@ -1,0 +1,7 @@
+# macOS
+.DS_Store
+
+# local tooling state
+.claude/
+node_modules/
+*.log

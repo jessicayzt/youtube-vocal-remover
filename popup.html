@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>YouTube Vocal Remover</title>
+<style>
+  body { font: 13px/1.45 "Roboto", Arial, sans-serif; margin: 0; padding: 14px 16px; width: 300px; color: #0f0f0f; background: #fff; }
+  @media (prefers-color-scheme: dark) { body { color: #f1f1f1; background: #212121; } }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  p { margin: 6px 0; }
+  .muted { opacity: .7; }
+  code { font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>YouTube Vocal Remover</h1>
+  <p>Open a video on <b>youtube.com/watch</b>. A control panel appears right under the player.</p>
+  <p>Turn it on to fetch the video's audio, remove the vocals with an on-device model and hear the result in sync with the video. Nothing is uploaded anywhere.</p>
+  <p class="muted" id="status">Checking engine…</p>
+  <script src="popup.js"></script>
+</body>
+</html>

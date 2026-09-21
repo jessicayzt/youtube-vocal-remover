@@ -1,0 +1,27 @@
+{
+  "default": "inst_hq_5",
+  "models": {
+    "inst_hq_5": {
+      "label": "UVR MDX-Net Inst HQ 5 (2025)",
+      "file": "UVR-MDX-NET-Inst_HQ_5.onnx",
+      "primaryStem": "instrumental",
+      "nFft": 5120,
+      "hop": 1024,
+      "dimF": 2560,
+      "dimT": 256,
+      "compensate": 1.01,
+      "uvrHash": "cb790d0c913647ced70fc6b38f5bea1a"
+    },
+    "inst_hq_3": {
+      "label": "UVR MDX-Net Inst HQ 3",
+      "file": "UVR-MDX-NET-Inst_HQ_3.onnx",
+      "primaryStem": "instrumental",
+      "nFft": 6144,
+      "hop": 1024,
+      "dimF": 3072,
+      "dimT": 256,
+      "compensate": 1.022,
+      "uvrHash": "55657dd70583b0fedfba5f67df11d711"
+    }
+  }
+}

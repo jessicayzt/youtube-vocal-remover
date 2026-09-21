@@ -1,0 +1,10 @@
+{
+  "name": "youtube-vocal-remover",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension: on-device AI vocal remover and transpose for YouTube videos",
+  "type": "module",
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'"
+  }
+}

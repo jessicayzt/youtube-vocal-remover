@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en" dark class="yt-vars">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vocal Remover — UI preview</title>
+<!-- Standalone preview of src/content/ui.js + ui.css. No extension APIs; open this file directly in a browser. -->
+<link rel="stylesheet" href="../src/content/ui.css">
+<style>
+  /* YouTube's theme variables, mirrored so the panel renders as it does on the
+     real page. Untick "YouTube CSS variables" to exercise ui.css's fallbacks. */
+  html.yt-vars {
+    --yt-spec-base-background: #fff;
+    --yt-spec-text-primary: #0f0f0f;
+    --yt-spec-text-secondary: #606060;
+    --yt-spec-badge-chip-background: rgba(0, 0, 0, 0.05);
+    --yt-spec-10-percent-layer: rgba(0, 0, 0, 0.1);
+    --yt-spec-call-to-action: #065fd4;
+  }
+  html.yt-vars[dark] {
+    --yt-spec-base-background: #0f0f0f;
+    --yt-spec-text-primary: #f1f1f1;
+    --yt-spec-text-secondary: #aaa;
+    --yt-spec-badge-chip-background: rgba(255, 255, 255, 0.1);
+    --yt-spec-10-percent-layer: rgba(255, 255, 255, 0.2);
+    --yt-spec-call-to-action: #3ea6ff;
+  }
+
+  html {
+    background: #fff;
+    color: #0f0f0f;
+    font-family: "Roboto", "Arial", sans-serif;
+    font-size: 14px;
+  }
+  html[dark] {
+    background: #0f0f0f;
+    color: #f1f1f1;
+  }
+  body {
+    margin: 0;
+    padding: 24px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 24px;
+  }
+
+  /* Fake watch column: 640 px player + #below, like YouTube's primary column. */
+  .column { width: 640px; max-width: 100%; }
+  .column.wide { width: 960px; }
+
+  .player {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #000 radial-gradient(ellipse at 30% 20%, #3a3a5c, #000 70%);
+  }
+  .player::after {
+    content: "fake player";
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 18px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .ytp-chrome-bottom {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 0;
+    height: 48px;
+    z-index: 1;
+  }
+  .ytp-progress-bar-container {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 36px;
+    height: 5px;
+    transition: height 0.1s;
+  }
+  .player:hover .ytp-progress-bar-container { height: 7px; }
+  .ytp-progress-bar { position: relative; width: 100%; height: 100%; }
+  .ytp-progress-list {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: rgba(255, 255, 255, 0.2);
+  }
+  .ytp-play-progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 0;
+    background: #f00;
+  }
+  .ytp-scrubber-container {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    z-index: 40;
+  }
+  .ytp-scrubber-button {
+    width: 13px;
+    height: 13px;
+    margin: -6.5px 0 0 -6.5px;
+    border-radius: 50%;
+    background: #f00;
+  }
+
+  #below h1 {
+    margin: 12px 0 0;
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.4;
+  }
+  #below p { margin: 6px 0 0; opacity: 0.7; }
+
+  /* Preview controls */
+  .sidebar { width: 380px; max-width: 100%; }
+  .sidebar h2 {
+    margin: 14px 0 8px;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    opacity: 0.7;
+  }
+  .sidebar h2:first-child { margin-top: 0; }
+  .sidebar button {
+    margin: 0 6px 6px 0;
+    padding: 5px 10px;
+    border: 1px solid rgba(128, 128, 128, 0.45);
+    border-radius: 8px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .sidebar button:hover { background: rgba(128, 128, 128, 0.15); }
+  .sidebar label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+  #log {
+    margin: 0;
+    padding: 10px;
+    min-height: 260px;
+    max-height: 440px;
+    overflow: auto;
+    border-radius: 8px;
+    background: rgba(128, 128, 128, 0.12);
+    font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <div class="column" id="column">
+    <div class="player" id="player">
+      <div class="ytp-chrome-bottom">
+        <div class="ytp-progress-bar-container">
+          <div class="ytp-progress-bar" id="progress-bar">
+            <div class="ytp-progress-list"><div class="ytp-play-progress" id="play-progress"></div></div>
+            <div class="ytp-scrubber-container" id="scrubber"><div class="ytp-scrubber-button"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- The panel is inserted as the first child of #below, above the title, as on YouTube. -->
+    <div id="below">
+      <h1>Some Song — Official Music Video (fake title, sits under the panel)</h1>
+      <p>1.2M views · 3 years ago</p>
+    </div>
+  </div>
+
+  <aside class="sidebar">
+    <h2>Scenario</h2>
+    <div>
+      <button id="btn-restart">Restart</button>
+      <button id="btn-pause">Pause sim</button>
+      <button id="btn-error">Error</button>
+      <button id="btn-unsupported">Unsupported</button>
+      <button id="btn-cache">From cache</button>
+      <button id="btn-detach">Detach panel (YT re-render)</button>
+      <button id="btn-replace-bar">Replace seek bar</button>
+    </div>
+    <h2>Page</h2>
+    <div>
+      <button id="btn-theme">Toggle light / dark</button>
+      <button id="btn-width">Toggle column width</button>
+      <label><input type="checkbox" id="chk-vars" checked> YouTube CSS variables</label>
+    </div>
+    <h2>Callbacks</h2>
+    <pre id="log"></pre>
+  </aside>
+
+  <script src="../src/content/ui.js"></script>
+  <script>
+  (function () {
+    'use strict';
+
+    var DURATION = 254; // 4:14
+    var TICK_MS = 100;
+    var SIM_STEP = 0.25; // simulated seconds per tick (2.5x fast-forward)
+
+    var logEl = document.getElementById('log');
+    function log(name, arg) {
+      var line = new Date().toLocaleTimeString() + '  ' + name +
+        (arg === undefined ? '' : ' → ' + JSON.stringify(arg));
+      var lines = (line + '\n' + logEl.textContent).split('\n');
+      logEl.textContent = lines.slice(0, 60).join('\n');
+    }
+
+    log('formatTime samples', [VRX_UI.formatTime(0), VRX_UI.formatTime(65), VRX_UI.formatTime(3725), VRX_UI.formatTime(NaN)]);
+
+    /* ---- panel + overlay ---- */
+    var below = document.getElementById('below');
+    var settings = { enabled: true, vocalLevel: 0, semitones: 0, modelId: 'inst_hq_5', quality: 'balanced' };
+    var models = [
+      { id: 'inst_hq_5', label: 'UVR MDX-Net Inst HQ 5 (2025)' },
+      { id: 'inst_hq_3', label: 'UVR MDX-Net Inst HQ 3' }
+    ];
+
+    var panel = VRX_UI.createPanel({
+      mount: below,
+      models: models,
+      settings: settings,
+      on: {
+        toggle: function (enabled) {
+          settings.enabled = enabled;
+          log('toggle', enabled);
+          if (enabled) resume(); else turnOff();
+        },
+        vocalLevel: function (level) { settings.vocalLevel = level; log('vocalLevel', level); },
+        transpose: function (semitones) { settings.semitones = semitones; log('transpose', semitones); },
+        model: function (id) { settings.modelId = id; log('model', id); restart(); },
+        quality: function (q) { settings.quality = q; log('quality', q); restart(); },
+        retry: function () { log('retry'); restart(); },
+        clearCache: function () { log('clearCache'); state.fromCache = false; restart(); }
+      }
+    });
+
+    var progressBar = document.getElementById('progress-bar');
+    var overlay = VRX_UI.createSeekbarOverlay(progressBar);
+
+    /* ---- fake engine state ---- */
+    var t = 0;          // simulated seconds since the engine started
+    var timer = null;
+    var frozen = false; // true while showing a fixed scenario (error, cache, ...)
+    var state = {
+      phase: 'starting', message: '', detail: null, backend: 'WebGPU', speed: null,
+      duration: DURATION, captured: [], decoded: [], processed: [], playhead: 0, fromCache: false
+    };
+
+    function total(ranges) {
+      var sum = 0;
+      for (var i = 0; i < ranges.length; i++) sum += ranges[i][1] - ranges[i][0];
+      return sum;
+    }
+
+    // Sort + merge so the ranges we hand the UI are sorted and non-overlapping.
+    function merge(list) {
+      list.sort(function (a, b) { return a[0] - b[0]; });
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i], last = out[out.length - 1];
+        if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+        else out.push([r[0], r[1]]);
+      }
+      return out;
+    }
+
+    // Two growing regions: from the start, and from a "seek" to 60% a few seconds in.
+    function grow(rate, lag) {
+      var list = [];
+      var a = Math.min(DURATION, Math.max(0, (t - lag) * rate));
+      if (a > 0) list.push([0, a]);
+      var seekAt = Math.round(DURATION * 0.6);
+      var b = Math.min(DURATION, seekAt + Math.max(0, (t - lag - 6) * rate));
+      if (b > seekAt) list.push([seekAt, b]);
+      return merge(list);
+    }
+
+    function render() {
+      panel.setState(state);
+      overlay.update(state);
+      var pct = state.playhead == null ? 0 : (state.playhead / DURATION) * 100;
+      document.getElementById('play-progress').style.width = pct + '%';
+      document.getElementById('scrubber').style.left = pct + '%';
+    }
+
+    function tick() {
+      t += SIM_STEP;
+      state.captured = grow(8, 0.5);
+      state.decoded = grow(5, 1.5);
+      state.processed = grow(2.6, 3);
+      state.playhead = t % DURATION;
+
+      var cap = total(state.captured), dec = total(state.decoded), pro = total(state.processed);
+      state.detail = null;
+      if (t < 0.5) {
+        state.phase = 'starting';
+        state.message = 'Loading model…';
+        state.speed = null;
+      } else if (dec === 0) {
+        state.phase = 'capturing';
+        state.message = 'Fetching audio… ' + VRX_UI.formatTime(cap) + ' of ' + VRX_UI.formatTime(DURATION);
+        state.speed = null;
+      } else if (pro === 0) {
+        state.phase = 'decoding';
+        state.message = 'Decoding audio…';
+        state.speed = null;
+      } else if (pro < DURATION - 0.01) {
+        state.phase = 'processing';
+        state.message = 'Removing vocals… ' + VRX_UI.formatTime(pro) + ' done';
+        state.speed = 2.6 + Math.sin(t) * 0.15;
+        var playedEnd = state.processed.length ? state.processed[0][1] : 0;
+        if (state.playhead > playedEnd) state.detail = 'Original audio plays until this position is processed';
+      } else {
+        state.phase = 'ready';
+        state.message = 'Vocals removed for the whole video';
+        state.speed = 2.6;
+      }
+      render();
+    }
+
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+
+    function resume() {
+      frozen = false;
+      stop();
+      timer = setInterval(tick, TICK_MS);
+      tick();
+    }
+
+    function restart() {
+      t = 0;
+      state.fromCache = false;
+      if (settings.enabled) resume(); else turnOff();
+    }
+
+    function turnOff() {
+      stop();
+      frozen = true;
+      state.phase = 'off';
+      state.message = 'Vocal Remover is off — playing the original audio';
+      state.detail = null;
+      state.speed = null;
+      render();
+    }
+
+    function freeze(patch) {
+      stop();
+      frozen = true;
+      for (var k in patch) state[k] = patch[k];
+      render();
+    }
+
+    /* ---- scenario buttons ---- */
+    document.getElementById('btn-restart').addEventListener('click', restart);
+    document.getElementById('btn-pause').addEventListener('click', function () {
+      if (timer) { stop(); this.textContent = 'Resume sim'; }
+      else if (!frozen) { resume(); this.textContent = 'Pause sim'; }
+    });
+    document.getElementById('btn-error').addEventListener('click', function () {
+      freeze({
+        phase: 'error',
+        message: 'Could not fetch the audio stream',
+        detail: 'HTTP 403 from googlevideo.com — the stream URL may have expired. Retry to request a fresh one.',
+        speed: null
+      });
+    });
+    document.getElementById('btn-unsupported').addEventListener('click', function () {
+      freeze({
+        phase: 'unsupported',
+        message: 'This browser cannot run the separation model',
+        detail: 'Neither WebGPU nor multi-threaded WebAssembly is available.',
+        backend: null,
+        speed: null,
+        captured: [], decoded: [], processed: [], playhead: null
+      });
+    });
+    document.getElementById('btn-cache').addEventListener('click', function () {
+      freeze({
+        phase: 'ready',
+        message: 'Restored from this session’s cache',
+        detail: null,
+        backend: 'WebGPU',
+        speed: null,
+        captured: [[0, DURATION]], decoded: [[0, DURATION]], processed: [[0, DURATION]],
+        playhead: 42,
+        fromCache: true
+      });
+    });
+    document.getElementById('btn-detach').addEventListener('click', function () {
+      // Simulate YouTube re-rendering #below and dropping our node.
+      panel.el.remove();
+      log('panel detached; isConnected', panel.el.isConnected);
+      setTimeout(function () {
+        panel.ensureMounted(below);
+        log('ensureMounted; isConnected', panel.el.isConnected);
+      }, 800);
+    });
+    document.getElementById('btn-replace-bar').addEventListener('click', function () {
+      // Simulate YouTube replacing .ytp-progress-bar: the controller would
+      // destroy the old overlay and create a new one on the new element.
+      overlay.destroy();
+      var fresh = progressBar.cloneNode(true);
+      progressBar.parentNode.replaceChild(fresh, progressBar);
+      progressBar = fresh;
+      overlay = VRX_UI.createSeekbarOverlay(progressBar);
+      render();
+      log('seek bar replaced; overlay recreated');
+    });
+
+    /* ---- page buttons ---- */
+    document.getElementById('btn-theme').addEventListener('click', function () {
+      document.documentElement.toggleAttribute('dark');
+    });
+    document.getElementById('btn-width').addEventListener('click', function () {
+      document.getElementById('column').classList.toggle('wide');
+    });
+    document.getElementById('chk-vars').addEventListener('change', function () {
+      document.documentElement.classList.toggle('yt-vars', this.checked);
+    });
+
+    resume();
+  })();
+  </script>
+</body>
+</html>
