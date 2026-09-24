@@ -14,6 +14,8 @@ const WINDOW_SECONDS = 40;       // decode at most this much per decodeAudioData
 const MIN_WINDOW_SECONDS = 1;    // decode as soon as this much is available with a trailing margin segment
 const SETTLE_MS = 1500;          // a stream with no new data for this long is decoded as-is
 const DECODE_TIMEOUT_MS = 20000; // decodeAudioData that takes longer is treated as failed
+const FAILED_RETRY_MS = 30000;   // a window the browser rejected is tried again after this long ...
+const FAILED_MAX_TRIES = 3;      // ... this many times in all (other sources may have arrived meanwhile)
 
 const QUARANTINE_MS = 1200;      // a fresh segment is not used until this long after it arrived (see onAdStart)
 const AD_LEAD_MS = 8000;         // a stream first seen this shortly before an ad began is the ad's own
@@ -174,7 +176,10 @@ export class SegmentStore {
       let a = idx, b = idx;
       while (a > 0 && list[a].start - list[a - 1].end <= GAP_TOLERANCE) a--;
       while (b + 1 < list.length && list[b + 1].start - list[b].end <= GAP_TOLERANCE) b++;
-      const run = { initBytes: g.initBytes, init: g.init, list, first: a, last: b, index: idx, settled: Date.now() - g.lastAppendAt > SETTLE_MS };
+      // Settled means the stream that delivered this run's last segment has gone quiet, not the whole
+      // group: the main player appending somewhere else in the video (the same format, so the same
+      // group) must not keep a finished helper's tail window waiting for a margin that never comes.
+      const run = { initBytes: g.initBytes, init: g.init, list, first: a, last: b, index: idx, settled: now - list[b].stream.lastAppendAt > SETTLE_MS };
       if (!best || list[b].end > best.list[best.last].end) best = run;
     }
     return best;
@@ -193,15 +198,17 @@ export class IncrementalDecoder {
    * @param {import('./buffers.js').TrackBuffers} buffers
    * @param {(info: object) => void} onProgress
    */
-  constructor(store, buffers, onProgress, { windowSeconds = WINDOW_SECONDS, minWindowSeconds = MIN_WINDOW_SECONDS } = {}) {
+  constructor(store, buffers, onProgress, { windowSeconds = WINDOW_SECONDS, minWindowSeconds = MIN_WINDOW_SECONDS, failedRetryMs = FAILED_RETRY_MS } = {}) {
     this.store = store;
     this.buffers = buffers;
     this.onProgress = onProgress;
     this.windowSeconds = windowSeconds;
     this.minWindowSeconds = minWindowSeconds;
+    this.failedRetryMs = failedRetryMs;
     this.decodedSamples = []; // ranges in samples that hold real audio
-    this.failedRanges = [];   // ranges in samples the browser could not decode (never played through us)
+    this.failed = [];         // { a, b, tries, at }: ranges in samples the browser could not decode (never played through us)
     this.running = false;
+    this.errorCount = 0;
     this.captureComplete = false;
     this.error = null;
     this.ctx = null;
@@ -213,17 +220,37 @@ export class IncrementalDecoder {
   get totalSamples() { return this.buffers.totalSamples; }
   decodedRanges() { return this.decodedSamples.map(([a, b]) => [a / SAMPLE_RATE, b / SAMPLE_RATE]); }
   isComplete() { return this.decodedSamples.length === 1 && this.decodedSamples[0][0] === 0 && this.decodedSamples[0][1] >= this.totalSamples; }
+  /** Failed ranges still standing, as [a, b] samples (ranges whose retry is due do not count: they are gaps again). */
+  get failedRanges() { const now = Date.now(); return this.failed.filter((f) => !this._retryDue(f, now)).map((f) => [f.a, f.b]); }
   failedRangesSeconds() { return this.failedRanges.map(([a, b]) => [a / SAMPLE_RATE, b / SAMPLE_RATE]); }
   _attempted() { return R.normalize(this.decodedSamples.concat(this.failedRanges)); }
+  _retryDue(f, now) { return f.tries < FAILED_MAX_TRIES && now - f.at >= this.failedRetryMs; }
+  _recordFailure(a, b) {
+    const hit = this.failed.find((f) => f.a < b && a < f.b);
+    if (hit) { hit.a = Math.min(hit.a, a); hit.b = Math.max(hit.b, b); hit.tries++; hit.at = Date.now(); }
+    else this.failed.push({ a, b, tries: 1, at: Date.now() });
+  }
+  /** Earliest time a standing failure becomes due for another try, or null. */
+  _nextRetryAt() {
+    let t = null;
+    for (const f of this.failed) if (f.tries < FAILED_MAX_TRIES) { const due = f.at + this.failedRetryMs; if (t === null || due < t) t = due; }
+    return t;
+  }
 
   /** Called whenever new segments may be available or capture state changed. */
   pump() {
     if (this.running) { this.rerun = true; return; }
     this.running = true;
     this.error = null; // a failure is retried on the next pump rather than sticking
-    this._loop().catch((e) => { this.error = e; console.error('[VocalRemover] decoder failed', e); }).finally(() => {
+    this._loop().then(() => { this.errorCount = 0; }, (e) => {
+      // an exception must not leave the decoder waiting for an append that may never come
+      this.error = e; this.errorCount++;
+      console.error('[VocalRemover] decoder failed', e);
+      this._scheduleSettle(Math.min(30000, 1000 * 2 ** Math.min(this.errorCount, 5)));
+    }).finally(() => {
       this.running = false;
       if (this.rerun) { this.rerun = false; this.pump(); }
+      else { const due = this._nextRetryAt(); if (due !== null) this._scheduleSettle(Math.max(200, due - Date.now())); }
     });
   }
 
@@ -231,10 +258,16 @@ export class IncrementalDecoder {
    * A run that is still growing is skipped until it has settled, and it settles by *time*: if no
    * further append ever comes (the helper is done or gone, the player paused), nothing would ever
    * look at it again and the last window of captured audio stayed undecoded -- and unprocessed.
+   * The same timer brings failed windows back for another try. Only the earliest pending wake-up
+   * is kept.
    */
-  _scheduleSettle() {
-    if (this.settleTimer) return;
-    this.settleTimer = setTimeout(() => { this.settleTimer = null; this.pump(); }, SETTLE_MS + 200);
+  _scheduleSettle(delay = SETTLE_MS + 200) {
+    const at = Date.now() + delay;
+    if (this.settleTimer && this.settleAt <= at) return;
+    if (this.settleTimer) clearTimeout(this.settleTimer);
+    this.settleAt = at;
+    this.settleTimer = setTimeout(() => { this.settleTimer = null; this.pump(); }, delay);
+    if (this.settleTimer && typeof this.settleTimer.unref === 'function') this.settleTimer.unref(); // Node (tests): never keep the process alive
   }
 
   /** Segments the store still holds back (see SegmentStore.onAdStart) need a look once released, even if nothing else arrives. */
@@ -294,19 +327,21 @@ export class IncrementalDecoder {
         }
       }
       if (!ok) {
-        // skip this one segment: it stays unprocessed (YouTube's own audio plays there), never silent-green
+        // skip this one segment for now: it stays unprocessed (YouTube's own audio plays there),
+        // never silent-green, and is tried again later, when another source may have supplied it
         const b = Math.min(this.totalSamples, Math.max(gap + 1, Math.round(list[index].end * SAMPLE_RATE)));
-        this.failedRanges = R.add(this.failedRanges, gap, b);
+        this._recordFailure(gap, b);
         this.onProgress({ decoded: this.decodedRanges(), failed: this.failedRangesSeconds() });
       }
       // guarantee forward progress even if the window produced nothing usable
-      if (R.firstGap(this._attempted(), gap, this.totalSamples) === gap) this.failedRanges = R.add(this.failedRanges, gap, Math.min(this.totalSamples, gap + Math.round(SAMPLE_RATE * 0.05)));
+      if (R.firstGap(this._attempted(), gap, this.totalSamples) === gap) this._recordFailure(gap, Math.min(this.totalSamples, gap + Math.round(SAMPLE_RATE * 0.05)));
       from = 0; // earlier gaps regain priority after each decode
     }
   }
 
   _silence(startSample, endSample) {
     this.decodedSamples = R.add(this.decodedSamples, startSample, endSample);
+    this._pruneFailed();
     this.buffers.syncMixReady(this.decodedSamples, startSample, endSample);
     this.onProgress({ decoded: this.decodedRanges() });
   }
@@ -360,16 +395,29 @@ export class IncrementalDecoder {
     const n = keepEnd - keepStart;
     this.buffers.writeMixture(keepStart, L.subarray(keepStart - decodedStartSample, keepStart - decodedStartSample + n), Rch.subarray(keepStart - decodedStartSample, keepStart - decodedStartSample + n));
     this.decodedSamples = R.add(this.decodedSamples, keepStart, keepEnd);
+    this._pruneFailed();
     this.buffers.syncMixReady(this.decodedSamples, keepStart, keepEnd);
     this.decodedSecondsTotal += n / SAMPLE_RATE;
     this.onProgress({ decoded: this.decodedRanges() });
     return true;
   }
 
+  /** Seconds the browser refused to decode for good (all tries used); YouTube's own audio plays there. */
+  exhaustedFailedSeconds() {
+    let t = 0;
+    for (const f of this.failed) if (f.tries >= FAILED_MAX_TRIES) t += (f.b - f.a) / SAMPLE_RATE;
+    return t;
+  }
+
+  /** Failures that decoding has since covered are forgotten. */
+  _pruneFailed() {
+    if (this.failed.length) this.failed = this.failed.filter((f) => !R.covers(this.decodedSamples, f.a, f.b));
+  }
+
   /** Capture has ended (helper finished or failed): allow decoding short/unsettled tails and silence tiny gaps. */
   finish() {
     this.finishing = true;
-    if (this.failedRanges.length) { this.failedRanges = []; this.captureComplete = false; }
+    if (this.failed.length) { this.failed = []; this.captureComplete = false; }
     this.pump();
   }
 }

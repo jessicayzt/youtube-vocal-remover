@@ -58,24 +58,55 @@
 
   // Per audio SourceBuffer (info):
   //   appends   running count; every kept append remembers its index i
-  //   head      { i, bytes } of the stream's first appends, kept for the life of the page: that is
-  //             where the codec headers are, and an engine that starts a fresh store for a stream
-  //             that has long been playing (the engine or the session restarted) needs them again
-  //   retained  { i, bytes } appended while capture is off, in order, with null marking an
-  //             abort()/changeType() between them (the player's parser was reset there, so ours
-  //             must be too; the headers stay valid across it and are kept)
+  //   head      { i, bytes, ad, msDuration } of the first appends of the *current media* in this
+  //             buffer: that is where the codec headers are, and an engine that starts a fresh
+  //             store for a stream that has long been playing (the engine or the session
+  //             restarted) needs them again
+  //   retained  { i, bytes, ad, msDuration } appended while capture is off, in order, with null
+  //             marking an abort()/changeType() between them (the player's parser was reset there,
+  //             so ours must be too; the headers stay valid across it and are kept)
   //   dropped   appends were lost to the budget after what is retained
-  //   sent      something of this stream has been sent already
+  //   sent      something of the current media has been sent already
+  //
+  // "Current media": YouTube reuses a MediaSource and its SourceBuffers for the next video of a
+  // playlist (the one it preloaded). The new video begins with a new initialization segment; from
+  // that append on, everything kept before it belongs to the previous video and is let go. Keeping
+  // it put the previous video's first seconds at the start of the next one.
 
-  // `ad` is the player's state when the bytes were appended, not when they are sent: kept data
-  // flushed during an ad is not ad audio, and headers re-sent during one must not be thrown away.
-  function sendSegment(info, bytes, retained, ad) {
-    let tsOffset = 0, msDuration = NaN;
+  // Does this append begin an initialization segment? WebM: the EBML header. MP4: an ftyp or moov
+  // box. Media segments begin with a Cluster (WebM) or moof/styp/sidx (MP4).
+  function startsWithInit(bytes) {
+    if (bytes.length < 8) return false;
+    if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return true;
+    const t = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    return t === 'ftyp' || t === 'moov';
+  }
+
+  // The head's own init (its first entry, when that append began with one) against a new one: the
+  // first bytes carry the container's duration and track identity, so a different media differs early.
+  function sameInit(info, view) {
+    const prev = info.head.length && startsWithInit(info.head[0].bytes) ? info.head[0].bytes : null;
+    if (!prev) return false;
+    const n = Math.min(256, prev.length, view.length);
+    if (n < 8) return false;
+    for (let k = 0; k < n; k++) if (prev[k] !== view[k]) return false;
+    return true;
+  }
+
+  function msDurationNow(info) {
+    try { return info.ms.duration; } catch (e) { return NaN; }
+  }
+
+  // `ad` and `msDuration` are the player's state when the bytes were appended, not when they are
+  // sent: kept data flushed during an ad is not ad audio, and a head that belonged to another
+  // media must carry that media's length, so the engine can tell it apart.
+  function sendSegment(info, entry, retained) {
+    const bytes = entry.bytes;
+    let tsOffset = 0;
     try { tsOffset = info.sb.timestampOffset || 0; } catch (e) { /* removed buffers throw */ }
-    try { msDuration = info.ms.duration; } catch (e) { /* ignore */ }
     // the head keeps its copy for the life of the page: hand over a duplicate of anything it holds
     const buf = info.head.some((h) => h.bytes === bytes) ? bytes.slice().buffer : bytes.buffer;
-    post({ t: 'seg', key: info.key, mime: info.mime, tsOffset, msDuration, ad: !!ad, retained: !!retained, buf }, [buf]);
+    post({ t: 'seg', key: info.key, mime: info.mime, tsOffset, msDuration: entry.msDuration, ad: !!entry.ad, retained: !!retained, buf }, [buf]);
     info.sent = true;
   }
 
@@ -111,7 +142,7 @@
     const firstRetained = info.retained.find((r) => r !== null);
     const nextIndex = firstRetained ? firstRetained.i : info.appends;
     let last = -1;
-    for (const h of info.head) { if (h.i >= nextIndex) break; sendSegment(info, h.bytes, true, h.ad); last = h.i; }
+    for (const h of info.head) { if (h.i >= nextIndex) break; sendSegment(info, h, true); last = h.i; }
     if (last >= 0 && last + 1 !== nextIndex) post({ t: 'discontinuity', key: info.key });
   }
 
@@ -128,7 +159,7 @@
     if (!msOpen(info)) return;
     for (const item of items) {
       if (item === null) post({ t: 'sb-reset', key: info.key, mime: info.mime });
-      else sendSegment(info, item.bytes, true, item.ad);
+      else sendSegment(info, item, true);
     }
     // Only a real hole needs the parser told. Kept appends that run straight into the live ones
     // are one contiguous byte stream, and a reset there would throw away a unit split across it.
@@ -160,6 +191,17 @@
       const info = sbInfo.get(this);
       if (info && info.isAudio) {
         const i = info.appends++;
+        // A new initialization segment starts a new media in this buffer (the next video of a
+        // playlist, or a format change): what was kept for the previous one is dropped, unsent, so
+        // its audio cannot reach the new video's session. The engine is told the stream restarted.
+        // The same init sent again (a format re-announced after a seek) is the same media.
+        const view = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+        if (view && startsWithInit(view) && (info.head.length || info.retained.length || info.sent) && !sameInit(info, view)) {
+          info.head = []; info.headBytes = 0;
+          info.retained = []; info.retainedBytes = 0; info.dropped = false;
+          info.sent = false;
+          if (captureEnabled) post({ t: 'sb-reset', key: info.key, mime: info.mime });
+        }
         const [maxAppends, maxBytes] = retainBudget();
         const wantHead = info.head.length < HEAD_MAX_APPENDS && info.headBytes < HEAD_MAX_BYTES;
         const canRetain = !captureEnabled && info.retained.length < maxAppends && info.retainedBytes < maxBytes;
@@ -168,12 +210,12 @@
         // an append costs the player nothing.
         const bytes = captureEnabled || canRetain || wantHead ? toBytes(data) : null;
         if (bytes) {
-          const ad = adPlaying();
-          if (wantHead) { info.head.push({ i, bytes, ad }); info.headBytes += bytes.byteLength; }
+          const entry = { i, bytes, ad: adPlaying(), msDuration: msDurationNow(info) };
+          if (wantHead) { info.head.push(entry); info.headBytes += bytes.byteLength; }
           if (captureEnabled) {
             if (info.retained.length || info.dropped) flushRetained(info); // a buffer setCapture() did not reach
-            sendSegment(info, bytes, false, ad);
-          } else if (canRetain) { info.retained.push({ i, bytes, ad }); info.retainedBytes += bytes.byteLength; }
+            sendSegment(info, entry, false);
+          } else if (canRetain) { info.retained.push(entry); info.retainedBytes += bytes.byteLength; }
         }
       }
     } catch (e) { /* never break the player */ }
@@ -237,6 +279,11 @@
 
   function reportVolume() {
     if (shadowed) post({ t: 'vol', volume: shadowed.volume, muted: shadowed.muted });
+  }
+  // The element YouTube is playing in. It marks it html5-main-video; a page can hold a second,
+  // preloading element, and a selector list would return whichever comes first in the document.
+  function mainVideo() {
+    return document.querySelector('#movie_player video.html5-main-video') || document.querySelector('#movie_player video') || document.querySelector('video.html5-main-video') || document.querySelector('video');
   }
   function installShadow(video) {
     if (!video || (shadowed && shadowed.video === video)) return;
@@ -315,9 +362,9 @@
         if (!armed) for (const ref of liveBuffers) { const sb = ref.deref(); const info = sb && sbInfo.get(sb); if (info) trimRetained(info); }
       }
       else if (m.t === 'throttle') helperThrottled = !!m.on;
-      else if (m.t === 'shadow') installShadow(document.querySelector('#movie_player video, video.html5-main-video, video'));
+      else if (m.t === 'shadow') installShadow(mainVideo());
       else if (m.t === 'unshadow') { setTakeover(false); removeShadow(); }
-      else if (m.t === 'takeover') { if (m.on && !shadowed) installShadow(document.querySelector('#movie_player video, video.html5-main-video, video')); setTakeover(!!m.on); }
+      else if (m.t === 'takeover') { if (m.on && !shadowed) installShadow(mainVideo()); setTakeover(!!m.on); }
       else if (m.t === 'ping') {
         // which video the player itself is on, and how long it says it is: after a navigation the
         // element still holds the previous video for a while, and its duration with it
@@ -350,10 +397,27 @@
     // At normal speed the player fills its buffer target and stops; the moment it stops growing,
     // the playhead is moved up to within SEEK_KEEP_SECONDS of the buffered end, and the player
     // fetches the next stretch. Its buffer health never looks poor and it never stalls.
-    const SEEK_KEEP_SECONDS = 10;     // runway kept ahead of the playhead after a seek
-    const SEEK_MIN_GAIN_SECONDS = 15; // a seek that would gain less than this is not worth it
+    // The runway kept after a seek is small on purpose: YouTube's player may hold as little as
+    // twenty seconds ahead of the playhead, and a helper that waited for more than that never
+    // seeked at all, fetching the whole video at playback speed instead.
+    const SEEK_KEEP_SECONDS = 3;      // runway kept ahead of the playhead after a seek
+    const SEEK_MIN_GAIN_SECONDS = 2;  // a seek that would gain less than this is not worth it
     const BUFFER_STILL_MS = 800;      // the buffered end has not moved for this long: the player is done fetching
     let finished = false, fetchedTo = 0, lastEnd = -1, endStillSince = 0, lastSeekAt = 0, lastSkipAt = 0;
+    // YouTube keeps the quality a player was set to in the origin's localStorage (yt-player-quality)
+    // and applies it to the next video loaded from that origin. On www.youtube.com this helper
+    // shares that storage with the page the person is watching, so asking for the lowest video
+    // quality here made every later video of theirs start at 144p. Whatever the preference was
+    // before the request is put back the moment it changes.
+    const QUALITY_KEYS = ['yt-player-quality'];
+    let qualityBefore = null; // key -> value (null when absent), taken before the player was touched
+    const readQuality = () => { const m = new Map(); for (const k of QUALITY_KEYS) { try { m.set(k, localStorage.getItem(k)); } catch (e) { m.set(k, null); } } return m; };
+    const restoreQuality = () => {
+      if (!qualityBefore) return;
+      for (const [k, v] of qualityBefore) {
+        try { if (localStorage.getItem(k) !== v) { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } } catch (e) { /* storage unavailable */ }
+      }
+    };
     const bufferedEndAt = (video, t) => {
       try {
         for (let i = 0; i < video.buffered.length; i++) if (video.buffered.start(i) <= t + 0.5 && video.buffered.end(i) >= t) return video.buffered.end(i);
@@ -382,7 +446,14 @@
       if (player) {
         // the helper only exists to pull the audio track down, so ask for the cheapest video:
         // it is the video streams that would otherwise compete with the real player for bandwidth
-        try { if (!qualitySet && typeof player.setPlaybackQualityRange === 'function') { player.setPlaybackQualityRange('tiny', 'tiny'); qualitySet = true; } } catch (e) { /* ignore */ }
+        try {
+          if (!qualitySet && typeof player.setPlaybackQualityRange === 'function') {
+            qualityBefore = readQuality();
+            player.setPlaybackQualityRange('tiny', 'tiny');
+            qualitySet = true;
+          }
+        } catch (e) { /* ignore */ }
+        restoreQuality();
         try { if (typeof player.mute === 'function' && !player.isMuted?.()) player.mute(); } catch (e) { /* ignore */ }
       }
       const err = errorText();

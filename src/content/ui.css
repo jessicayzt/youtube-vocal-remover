@@ -395,6 +395,14 @@ html[dark] .vrx-panel {
   font-variant-numeric: tabular-nums;
 }
 
+/* Reset shows only when transposed. Hidden, it keeps its width, so the stepper and the controls
+   after it do not jump when it appears. More specific than the panel-wide [hidden] rule above. */
+.vrx-panel .vrx-reset[hidden] {
+  display: inline-block !important;
+  visibility: hidden;
+  pointer-events: none;
+}
+
 /* Selects */
 .vrx-select {
   height: 26px;

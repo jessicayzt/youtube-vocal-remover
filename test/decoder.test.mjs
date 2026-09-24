@@ -37,6 +37,7 @@ class FakeOfflineAudioContext {
 globalThis.OfflineAudioContext = FakeOfflineAudioContext;
 
 const { TrackBuffers, INT16_SCALE } = await import('../src/offscreen/buffers.js');
+const R = globalThis.VRX.ranges;
 const { SegmentStore, IncrementalDecoder } = await import('../src/offscreen/decoder.js');
 
 const fixture = new Uint8Array(readFileSync(new URL('./fixtures/test-a-128k-44100Hz-1ch.webm', import.meta.url)));
@@ -285,6 +286,52 @@ test('a segment that arrives right before finish() is decoded once its quarantin
   assert.equal(buffers.countReady(buffers.mixReady), 0, 'everything is still held back');
   await sleep(2100); await settle(decoder);
   assert.ok(decoder.isComplete(), 'decoded on its own once released: ' + JSON.stringify(decoder.decodedSamples));
+});
+
+// A window the browser rejected is not final: another source may deliver the same stretch later, so
+// it is tried again after a while, a bounded number of times, without anyone having to pump.
+test('a window the browser could not decode is retried on its own later', async () => {
+  decodeCalls.length = 0;
+  const media = units.filter((u) => u.kind === 'media');
+  const badStart = media[3].info.start;
+  globalThis.__failIfStartIn = [badStart - 0.001, badStart + 0.001];
+  try {
+    const store = new SegmentStore({ quarantineMs: 0 });
+    const buffers = new TrackBuffers(Math.round(DURATION * SR));
+    const decoder = new IncrementalDecoder(store, buffers, () => {}, { windowSeconds: 0.6, minWindowSeconds: 0.5, failedRetryMs: 400 });
+    store.ingest({ key: 'A', source: 'embed', mime: 'audio/webm', bytes: fixture, expectedDuration: DURATION });
+    decoder.pump(); await settle(decoder);
+    assert.equal(decoder.failedRanges.length, 1, 'one region failed');
+    assert.ok(!decoder.isComplete());
+    globalThis.__failIfStartIn = null; // the browser would decode it now
+    await sleep(700); await settle(decoder);
+    assert.ok(decoder.isComplete(), 'retried and completed without a pump: ' + JSON.stringify(decoder.failedRanges));
+    assert.equal(decoder.failed.length, 0, 'the failure is forgotten once the region is decoded');
+  } finally { globalThis.__failIfStartIn = null; }
+});
+
+// The helper finished (or died) with its run's last window lacking a trailing margin, while the
+// main player keeps appending somewhere else in the video in the same format. Settledness judged on
+// the whole group never came, and that last window stayed undecoded until the listener got there.
+test('a run settles when the stream that delivered its tail goes quiet, whatever other streams do', async () => {
+  const store = new SegmentStore({ quarantineMs: 0 });
+  const buffers = new TrackBuffers(Math.round(DURATION * SR));
+  const decoder = new IncrementalDecoder(store, buffers, () => {});
+  const init = units.find((u) => u.kind === 'init');
+  const media = units.filter((u) => u.kind === 'media');
+  // helper: init + clusters 0..3, then nothing more (its tail has no margin segment after it)
+  store.ingest({ key: 'embed:1', source: 'embed', mime: 'audio/webm', bytes: init.bytes, expectedDuration: DURATION });
+  for (const u of media.slice(0, 4)) store.ingest({ key: 'embed:1', source: 'embed', mime: 'audio/webm', bytes: u.bytes, expectedDuration: DURATION });
+  // main player: same format, appending far ahead, and keeping on appending
+  store.ingest({ key: 'main:1', source: 'main', mime: 'audio/webm', bytes: init.bytes, expectedDuration: DURATION });
+  store.ingest({ key: 'main:1', source: 'main', mime: 'audio/webm', bytes: media[media.length - 1].bytes, expectedDuration: DURATION });
+  store.streams.get('embed:1').lastAppendAt = Date.now() - 5000; // the helper's stream has been quiet
+  const keepAppending = setInterval(() => { store.streams.get('main:1').lastAppendAt = Date.now(); }, 100);
+  try {
+    decoder.pump(); await settle(decoder);
+    const tailEnd = Math.round(media[3].info.end * SR);
+    assert.ok(R.covers(decoder.decodedSamples, 0, tailEnd - 2000), "the helper's whole run, tail included, is decoded although the main stream is busy: " + JSON.stringify(decoder.decodedSamples));
+  } finally { clearInterval(keepAppending); }
 });
 
 test('a stream whose duration is merely close is still this video', () => {

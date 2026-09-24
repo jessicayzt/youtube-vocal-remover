@@ -20,6 +20,8 @@ class SeparatorClient {
     this.current = null; this.queue = []; this.counter = 0; this.starting = false;
     this.lastEventAt = 0;
     this.waiters = new Map(); // session -> resolvers waiting for its running job to end
+    this.forceWasm = false;   // set once WebGPU has failed or stalled twice: the model then runs on WebAssembly
+    this.loadingStalls = 0;
     this.spawn();
     setInterval(() => this.watchdog(), 5000);
   }
@@ -28,7 +30,7 @@ class SeparatorClient {
     const worker = new Worker(chrome.runtime.getURL('src/offscreen/separator-worker.js'), { type: 'module' });
     worker.onmessage = (e) => { if (this.worker === worker) this.onMessage(e.data); };
     worker.onerror = (e) => { if (this.worker === worker) this.restartWorker('worker error: ' + (e && e.message || e)); };
-    worker.postMessage({ type: 'init', registry: this.engine.registry });
+    worker.postMessage({ type: 'init', registry: this.engine.registry, forceWasm: this.forceWasm });
     this.worker = worker;
   }
 
@@ -55,7 +57,11 @@ class SeparatorClient {
     else if (s.jobState === 'running') limit = this.advanced ? JOB_STALL_MS.running : JOB_STALL_MS.firstChunk;
     else return; // waiting for audio, or between states
     const idle = Date.now() - this.lastEventAt;
-    if (idle > limit) this.restartWorker(`no progress for ${Math.round(idle / 1000)} s while ${s.jobState}`);
+    if (idle > limit) {
+      // a model that cannot even load twice in a row is not going to on this backend
+      if (s.jobState === 'loading' && ++this.loadingStalls >= 2 && !this.forceWasm) { this.forceWasm = true; console.warn('[VocalRemover] the model would not load on WebGPU; switching to WebAssembly'); }
+      this.restartWorker(`no progress for ${Math.round(idle / 1000)} s while ${s.jobState}`);
+    }
   }
 
   request(session) {
@@ -124,8 +130,26 @@ class SeparatorClient {
     this.lastEventAt = Date.now();
     if (m.type === 'progress') {
       if (this.startChunks == null) this.startChunks = m.processedChunks;
-      else if (m.processedChunks > this.startChunks) this.advanced = true;
+      else if (m.processedChunks > this.startChunks) { this.advanced = true; this.loadingStalls = 0; }
     }
+    if (m.type === 'error') {
+      // A failed job (a lost GPU device, an out-of-memory) used to be final until the person
+      // pressed Retry. It is retried once on a fresh worker, then once more on WebAssembly, and
+      // only then shown as an error.
+      session.jobErrors = (session.jobErrors || 0) + 1;
+      if (session.jobErrors <= 2) {
+        if (session.jobErrors === 2) this.forceWasm = true;
+        console.warn('[VocalRemover] separation failed:', m.message, this.forceWasm ? '- retrying on WebAssembly' : '- retrying');
+        session.jobState = 'idle';
+        this.current = null;
+        this._settle(session);
+        if (session.needsProcessing && !this.queue.includes(session)) this.queue.unshift(session);
+        session.broadcastState(true);
+        this.restartWorker('job error: ' + m.message);
+        return;
+      }
+    }
+    if (m.type === 'done') session.jobErrors = 0;
     session.onWorkerEvent(m);
     if (m.type === 'done' || m.type === 'cancelled' || m.type === 'error') {
       this.current = null;
@@ -267,7 +291,12 @@ chrome.runtime.onConnect.addListener((port) => {
   };
   port.onMessage.addListener((m) => {
     if (!m || typeof m !== 'object') return;
-    enginePromise.then((engine) => handle(engine, m)).catch((e) => console.error('[VocalRemover] message failed', e));
+    enginePromise.then(
+      (engine) => { try { handle(engine, m); } catch (e) { console.error('[VocalRemover] message failed', e); } },
+      // an engine that never came up would otherwise swallow every message and leave the page on
+      // "Starting the audio engine…" for good
+      (e) => { if (m.type === 'hello') reply({ type: 'error', message: 'The audio engine could not start: ' + String(e && e.message || e), detail: 'Reload the extension (chrome://extensions) and the page to try again.' }); },
+    );
   });
   port.onDisconnect.addListener(() => {
     enginePromise.then(() => {

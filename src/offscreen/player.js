@@ -46,6 +46,13 @@ export class Player {
 
   get running() { return this.ready && this.ctx && this.ctx.state === 'running'; }
 
+  /** A context Chrome has suspended (device change, idle policy) only comes back on resume(). */
+  ensureRunning() {
+    if (!this.ready || !this.ctx || this.ctx.state === 'running' || this.ctx.state === 'closed' || this.resuming) return;
+    this.resuming = true;
+    this.ctx.resume().catch(() => {}).finally(() => { this.resuming = false; });
+  }
+
   bind(session) {
     if (!this.ready) return;
     if (this.bound === session) return;

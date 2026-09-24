@@ -20,13 +20,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const sessions = new Map(); // modelId -> { session, backend, spec }
 let registry = null;
+let forceWasm = false; // the offscreen document decided WebGPU is not working out here
 let job = null;
 const post = (m) => self.postMessage(m);
 
 self.onmessage = (e) => {
   const m = e.data;
   switch (m.type) {
-    case 'init': registry = m.registry; break;
+    case 'init': registry = m.registry; forceWasm = !!m.forceWasm; break;
     case 'start': startJob(m); break;
     case 'priority': if (job && job.id === m.jobId) { if (m.block != null) job.priorityBlock = m.block; job.playing = !!m.playing; job.wake(); } break;
     case 'mix-progress': if (job && job.id === m.jobId) job.wake(); break;
@@ -49,7 +50,7 @@ async function getSession(modelId) {
   if (!spec) throw new Error('unknown model ' + modelId);
   const url = new URL('../../models/' + spec.file, import.meta.url).href;
   let session = null, backend = 'wasm';
-  if (await hasWebGPU()) {
+  if (!forceWasm && await hasWebGPU()) {
     try {
       session = await ort.InferenceSession.create(url, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' });
       backend = 'webgpu';

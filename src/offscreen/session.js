@@ -24,6 +24,10 @@ const QUALITY = {
   high: { overlap: 0.5, denoise: true },
 };
 
+function describeHelper(kind) {
+  return kind === 'embed-nocookie' ? 'cookieless embed' : kind === 'embed-iframe' ? 'embed' : kind === 'watch-iframe' ? 'hidden watch page' : kind === 'watch-tab' ? 'background tab' : 'helper player';
+}
+
 export class Session {
   constructor(engine, { videoId, duration, title }) {
     this.engine = engine;
@@ -74,13 +78,18 @@ export class Session {
     // a fresh attach (Retry) clears an earlier processing error; a dead audio output does not go away
     this.error = playerError;
     if (!this.cacheLoaded) this.cacheLoaded = this.loadFromCache();
-    await this.cacheLoaded;
+    // a cache that does not answer must not hold the session hostage: go ahead without it
+    await Promise.race([this.cacheLoaded, new Promise((resolve) => setTimeout(resolve, 20000))]);
     if (this.controller !== port) return;
-    this.engine.setActive(this);
+    // whatever goes wrong below, the controller must hear 'plan' (it holds captured audio until it
+    // does) and the status timer must run (or the panel stays on "Starting…" with no way to tell)
+    try { this.engine.setActive(this); } catch (e) { console.error('[VocalRemover] could not activate the session', e); }
     const needCapture = !this.decoder.isComplete();
     this.send({ type: 'plan', needCapture });
-    if (needCapture) this.decoder.pump();
-    this.ensureProcessing();
+    try {
+      if (needCapture) this.decoder.pump();
+      this.ensureProcessing();
+    } catch (e) { console.error('[VocalRemover] could not start decoding or processing', e); }
     this.startTimers();
     this.broadcastState(true);
   }
@@ -158,8 +167,10 @@ export class Session {
           if (m.ad && !info.ad) this.store.onAdStart(prefix + ':'); // the helper's own ad began
           info.ad = !!m.ad;
         }
-        if (m.event === 'progress') { this.embed.progress = m; this.send({ type: 'embed-progress' }); }
-        else if (m.event === 'ended') { this.embed.ended = true; this.decoder.finish(); this.send({ type: 'embed-progress' }); }
+        // a running player is not progress; captured audio is (ingestSegment reports that). An ad
+        // running its course counts too, so the wait for it is not mistaken for a stall.
+        if (m.event === 'progress') { this.embed.progress = m; this.send({ type: m.ad ? 'embed-progress' : 'embed-keepalive' }); }
+        else if (m.event === 'ended') { this.embed.ended = true; this.decoder.finish(); this.send({ type: 'embed-ended' }); }
         else if (m.event === 'alive') { this.send({ type: 'embed-alive', info: (m.stage || 'page') + ' ' + (m.top ? '(top-level tab)' : '(iframe)') }); }
         else if (m.event === 'dom') { this.embed.dom = m; this.send({ type: 'embed-dom', info: { hasPlayer: m.hasPlayer, hasVideo: m.hasVideo, title: m.title, error: m.error, text: m.text, readyState: m.readyState, size: m.size } }); }
         else if (m.event === 'error') { this.send({ type: 'embed-error', message: m.message || 'helper player error' }); }
@@ -211,7 +222,11 @@ export class Session {
     if (m.ad && !this.mainAd) this.store.onAdStart('main:'); // an ad began: take back what it may have appended unflagged
     this.mainAd = !!m.ad;
     if (!Number.isFinite(m.mediaTime)) return;
-    if (m.playing && this.settings.enabled) this.engine.setActive(this);
+    if (m.playing && this.settings.enabled) {
+      this.engine.setActive(this);
+      // a context Chrome suspended (output device change, idle policy) comes back on resume()
+      if (!this.engine.player.running) this.engine.player.ensureRunning();
+    }
     if (this.engine.active === this) this.engine.player.sync(this, m);
     const block = Math.floor((m.mediaTime * SAMPLE_RATE) / BLOCK_SIZE);
     const now = Date.now();
@@ -382,7 +397,9 @@ export class Session {
     const cache = this.engine.cache;
     try {
       const mix = await cache.load(this.mixKey);
-      if (mix && mix.totalSamples === this.totalSamples) {
+      // a load that arrives late (the attach went ahead without it) must not overwrite what the
+      // decoder has produced in the meantime
+      if (mix && mix.totalSamples === this.totalSamples && this.decoder.decodedSamples.length === 0) {
         this.buffers.mixL.set(new Int16Array(mix.mixL)); this.buffers.mixR.set(new Int16Array(mix.mixR));
         this.buffers.mixReady.set(new Uint8Array(mix.mixReady));
         const ranges = R.fromBitmap(this.buffers.mixReady, BLOCK_SIZE, 1, this.totalSamples).map(([a, b]) => [Math.round(a), Math.round(b)]);
@@ -470,6 +487,10 @@ export class Session {
         detail = 'The audio arriving so far belongs to a different item (an ad, or a video of another length); waiting for this video\'s own audio.';
       } else if (this.embed.failed && !this.decoder.isComplete()) detail = 'Background fetch unavailable' + (this.embed.reason ? ' (' + this.embed.reason + ')' : '') + '; processing follows playback instead.';
       else if (this.embed.active && this.embed.kind === 'watch-tab' && !this.decoder.isComplete()) detail = 'Fetching the audio in a temporary background tab (it closes by itself).';
+      else if (this.embed.active && !this.embed.progress && !this.decoder.isComplete()) detail = `Starting the background fetch (${describeHelper(this.embed.kind)})…`;
+      else if (this.decoder.exhaustedFailedSeconds() > 0 && this.jobState === 'waiting') detail = `${Math.round(this.decoder.exhaustedFailedSeconds())} s could not be decoded by the browser even after retries; YouTube's own audio plays there and processing stops short of it.`;
+      else if (this.decoder.failedRanges.length) detail = `${Math.round(R.total(this.decoder.failedRangesSeconds()))} s could not be decoded by the browser and stay unprocessed; they are retried a few times.`;
+      else if (this.lastSync && this.lastSync.playing && this.engine.active === this && !this.engine.player.running) detail = `Audio output is ${this.engine.player.ctx ? this.engine.player.ctx.state : 'not started'}; trying to resume it, the original audio plays meanwhile.`;
       else if (this.decoder.error) detail = 'Decoding hit an error and is being retried: ' + String(this.decoder.error && this.decoder.error.message || this.decoder.error);
       else if (this.jobState === 'waiting') detail = 'Waiting for more audio to be fetched…';
       else if (this.jobState === 'running' && Date.now() - this.lastJobEventAt > 20000) detail = `The separation model has not reported progress for ${Math.round((Date.now() - this.lastJobEventAt) / 1000)} s; it is restarted if this continues.`;

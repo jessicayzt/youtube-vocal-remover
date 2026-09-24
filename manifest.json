@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Vocal Remover",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Removes vocals from YouTube videos.",
   "minimum_chrome_version": "124",
   "icons": {

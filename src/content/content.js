@@ -25,8 +25,12 @@
   });
   const cmdHook = (msg) => window.postMessage(Object.assign({ __vrxCmd: true }, msg), location.origin);
 
+  const CONNECT_TIMEOUT_MS = 15000; // a background worker that never answers must not leave the panel on "Starting…" for good
   async function connectEngine(name) {
-    const res = await chrome.runtime.sendMessage({ type: 'ensure-offscreen' });
+    const res = await Promise.race([
+      chrome.runtime.sendMessage({ type: 'ensure-offscreen' }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("the extension's background worker did not answer")), CONNECT_TIMEOUT_MS)),
+    ]);
     if (!res || !res.ok) throw new Error((res && res.error) || 'offscreen document unavailable');
     return chrome.runtime.connect({ name });
   }
@@ -160,13 +164,14 @@
     videoId: null, video: null, duration: null,
     port: null, sessionActive: false, sessionToken: 0, engineReady: false, reconnectAttempts: 0,
     panel: null, overlay: null, overlayBar: null, mounting: null,
-    helper: null, helperWatchdog: null, helperFailures: [],
-    helperWanted: false, helperGateSince: null, helperThrottled: false, lastStallAt: 0,
+    helper: null, helperWatchdog: null, helperFailures: [], helperRetryAt: 0, captureNeeded: false,
+    helperWanted: false, helperGateSince: null, helperThrottled: false, helperThrottledAt: 0, lastStallAt: 0,
     adShowing: false, adObserver: null,
     engineState: null, takeover: false, heartbeat: null, videoListeners: [], preflight: null,
     pending: [], pendingBytes: 0, pendingDropped: new Set(),
     lastPlayhead: 0, durationMismatchTicks: 0, durationRestarts: 0,
-    lastPong: null,
+    lastPong: null, pendingVideo: null, pendingVideoTicks: 0,
+    qualityPrefBefore: undefined,
   };
 
   const wall = () => performance.timeOrigin + performance.now();
@@ -181,6 +186,36 @@
     }
   }
   const currentVideoId = () => (location.pathname === '/watch' ? new URLSearchParams(location.search).get('v') : null);
+  // The element YouTube is playing in. It marks it html5-main-video; a page can hold a second,
+  // preloading element, and a selector list returns whichever comes first in the document.
+  const mainVideo = () => document.querySelector('#movie_player video.html5-main-video') || document.querySelector('#movie_player video');
+
+  // ---------------------------------------------------------------- the person's quality preference
+  // YouTube keeps the last quality a player was set to in localStorage and applies it to the next
+  // video from the same origin. A helper on www.youtube.com asked for the lowest quality and that
+  // became the preference of the page being watched. Two defences: the helper restores the value
+  // itself (hook.js), and this page watches the key while a helper is alive and puts its own value
+  // back if it turns into 144p. Storage events fire here for every same-origin document's writes.
+  const QUALITY_KEY = 'yt-player-quality';
+  const readQualityPref = () => { try { return localStorage.getItem(QUALITY_KEY); } catch (e) { return null; } };
+  const prefIsLowest = (v) => typeof v === 'string' && /quality\\?":\s*\\?"?144\b/.test(v);
+  const writeQualityPref = (v) => { try { if (v === null) localStorage.removeItem(QUALITY_KEY); else localStorage.setItem(QUALITY_KEY, v); } catch (e) { /* ignore */ } };
+  window.addEventListener('storage', (e) => {
+    if (e.key !== QUALITY_KEY || !S.helper || S.qualityPrefBefore === undefined) return;
+    if (prefIsLowest(e.newValue) && !prefIsLowest(S.qualityPrefBefore)) {
+      log("restoring the quality preference the helper's player changed");
+      writeQualityPref(S.qualityPrefBefore);
+    }
+  });
+  /** One-time: an earlier version's helper left 144p behind as the preference; back to automatic. */
+  async function repairQualityPreference() {
+    try {
+      const { qualityRepaired } = await chrome.storage.local.get('qualityRepaired');
+      if (qualityRepaired) return;
+      if (prefIsLowest(readQualityPref())) { writeQualityPref(null); log("cleared the 144p quality preference left by an earlier version's helper"); }
+      await chrome.storage.local.set({ qualityRepaired: true });
+    } catch (e) { /* ignore */ }
+  }
 
   // ---------------------------------------------------------------- settings
   async function loadSettings() {
@@ -279,13 +314,16 @@
         S.engineReady = true;
         S.reconnectAttempts = 0;
         pendingDrain(); // everything captured while the engine was starting
+        S.captureNeeded = !!m.needCapture;
         if (m.needCapture) wantHelper(); else { S.helperWanted = false; removeHelper(); }
         break;
       case 'need-embed': wantHelper(); break;
-      case 'capture-complete': S.helperWanted = false; removeHelper(); break;
-      case 'embed-alive': if (S.helper) { S.helper.alive = true; S.helper.lastProgress = Date.now(); log('helper', S.helper.kind, 'alive:', m.info || ''); } break;
+      case 'capture-complete': S.captureNeeded = false; S.helperWanted = false; removeHelper(); break;
+      case 'embed-alive': if (S.helper) { S.helper.alive = true; log('helper', S.helper.kind, 'alive:', m.info || ''); } break;
+      case 'embed-keepalive': if (S.helper) S.helper.alive = true; break; // the helper's player is running; only data counts as progress
       case 'embed-dom': if (S.helper) { S.helper.dom = m.info; S.helper.lastProgress = Date.now(); log('helper', S.helper.kind, 'page state:', m.info); } break;
       case 'embed-progress': if (S.helper) { S.helper.progress = true; S.helper.lastProgress = Date.now(); } break;
+      case 'embed-ended': if (S.helper) { S.helper.progress = true; S.helper.ended = true; S.helper.lastProgress = Date.now(); } break; // all fetched; the engine finishes decoding, then removes it
       case 'embed-error': failHelper('helper player error: ' + (m.message || 'unknown')); break;
       case 'embed-failed': removeHelper(); break;
       case 'state':
@@ -333,6 +371,7 @@
       const p = S.lastPong;
       if (p && (p.videoId === videoId || p.videoId == null)) return true; // ours, or a player that does not say
       if (Date.now() - t0 > PLAYER_SWITCH_WAIT_MS) return true;
+      setPreflight('Waiting for the player to switch to this video…');
     }
   }
   /**
@@ -373,10 +412,10 @@
     S.sessionActive = true;
     S.videoId = videoId;
     S.engineState = null; S.engineReady = false;
-    S.helperFailures = [];
+    S.helperFailures = []; S.helperRetryAt = 0; S.captureNeeded = false;
     S.helperGateSince = null; S.helperThrottled = false; S.lastStallAt = 0; S.preflight = null; S.durationMismatchTicks = 0;
     pushUIState();
-    const video = await waitFor(() => document.querySelector('#movie_player video.html5-main-video, #movie_player video'), 20000);
+    const video = await waitFor(mainVideo, 20000);
     if (!alive()) return;
     if (!video) { failSession('Could not find the video player on this page.'); return; }
     S.video = video;
@@ -535,8 +574,11 @@
   }
   function heartbeat() {
     if (S.video && isPlaying(S.video)) sendSync('tick');
+    // every kind of helper failed a while ago: try the whole ladder once more
+    if (!S.helperWanted && S.captureNeeded && S.helperRetryAt && Date.now() >= S.helperRetryAt && !S.helper) { S.helperRetryAt = 0; S.helperFailures = []; log('helper: retrying after the earlier failures'); wantHelper(); }
     maybeStartHelper();
     updateHelperThrottle();
+    watchVideoElement();
     watchVideoSource();
     pushUIState(); refreshOverlayTarget();
     if (S.panel) { const mount = document.querySelector('#below'); if (mount) S.panel.ensureMounted(mount); }
@@ -545,6 +587,25 @@
     for (const [el, ev, fn] of S.videoListeners) el.removeEventListener(ev, fn);
     S.videoListeners = [];
     if (S.heartbeat) { clearInterval(S.heartbeat); S.heartbeat = null; }
+  }
+  /**
+   * YouTube can move playback to another <video> element (it keeps a second one for the next
+   * video of a playlist). Sync, listeners and the volume shadow have to follow it, or the engine
+   * keeps taking its clock from an element that has gone idle.
+   */
+  function watchVideoElement() {
+    const v = mainVideo();
+    if (!v || v === S.video) { S.pendingVideo = null; return; }
+    // two heartbeats of stability: a page mid re-render must not flap the takeover back and forth
+    if (v !== S.pendingVideo) { S.pendingVideo = v; S.pendingVideoTicks = 0; return; }
+    if (++S.pendingVideoTicks < 2) return;
+    S.pendingVideo = null;
+    log('the player moved to another <video> element; following it');
+    setTakeover(false);
+    S.video = v;
+    attachVideo(v);
+    cmdHook({ t: 'shadow' });
+    sendSync('element');
   }
   /**
    * The <video> is shared with ads, so its duration changes while one plays and comes back after.
@@ -614,10 +675,13 @@
   // Started while the real player is still filling its buffer, it competes for bandwidth and
   // YouTube puts up its "Experiencing interruptions?" toast. So it waits for a healthy buffer,
   // and steps aside whenever the real player stalls or its buffer runs low.
-  const HELPER_MIN_BUFFER_SECONDS = 12;
-  const HELPER_LOW_BUFFER_SECONDS = 5; // below this while playing, the helper stands aside before a stall happens
+  const HELPER_MIN_BUFFER_SECONDS = 12;    // buffer the player must have before the helper starts
+  const HELPER_LOW_BUFFER_SECONDS = 5;     // below this while playing, the helper stands aside before a stall happens
+  const HELPER_RESUME_BUFFER_SECONDS = 8;  // and comes back once the player has this much again
+  const HELPER_THROTTLE_MAX_MS = 30000;    // or after this long anyway, if the player is at least playing
   const HELPER_MAX_WAIT_MS = 45000;
   const HELPER_RESUME_AFTER_MS = 6000;
+  const HELPER_RETRY_MS = 5 * 60 * 1000;   // after every kind of helper has failed, before the ladder is tried again
 
   function bufferedAhead(v) {
     try {
@@ -641,6 +705,7 @@
   function throttleHelper(on, reason) {
     if (S.helperThrottled === on) return;
     S.helperThrottled = on;
+    if (on) S.helperThrottledAt = Date.now();
     sendToEngine({ type: 'throttle', on });
     log('helper', on ? 'paused: ' + reason : 'resumed');
   }
@@ -658,8 +723,11 @@
       if (S.helper && isPlaying(v) && !nearEnd && bufferedAhead(v) < HELPER_LOW_BUFFER_SECONDS) { S.lastStallAt = Date.now(); throttleHelper(true, 'the video buffer is running low'); }
       return;
     }
+    // Resume below the start threshold, and after a while regardless: a player that keeps only a
+    // small buffer would otherwise leave the helper paused for good, and the fetch stuck with it.
     const settled = Date.now() - S.lastStallAt > HELPER_RESUME_AFTER_MS;
-    if (settled && (v.paused || (v.readyState >= 3 && bufferedAhead(v) >= HELPER_MIN_BUFFER_SECONDS))) throttleHelper(false);
+    const longEnough = Date.now() - S.helperThrottledAt > HELPER_THROTTLE_MAX_MS && v.readyState >= 3 && !v.seeking;
+    if ((settled && (v.paused || (v.readyState >= 3 && bufferedAhead(v) >= HELPER_RESUME_BUFFER_SECONDS))) || longEnough) throttleHelper(false);
   }
 
   // Stage 1 is YouTube's privacy-enhanced embed domain: it carries none of the account's cookies,
@@ -684,6 +752,7 @@
     const kind = HELPER_STAGES[stage];
     if (!kind) return;
     if (kind === 'watch-tab') { startHelperTab(stage); return; }
+    S.qualityPrefBefore = readQualityPref(); // what to put back if the helper's player changes it
     const iframe = document.createElement('iframe');
     iframe.className = 'vrx-helper-embed';
     iframe.name = 'vrx-helper';
@@ -705,6 +774,7 @@
   async function startHelperTab(stage) {
     if (!S.sessionActive || !S.videoId || S.helper) return;
     const kind = 'watch-tab';
+    S.qualityPrefBefore = readQualityPref();
     S.helper = { kind, stage, el: null, tabId: null, started: Date.now(), alive: false, progress: false, lastProgress: Date.now(), dom: null, opening: true };
     let res = null;
     try { res = await chrome.runtime.sendMessage({ type: 'open-helper', url: helperUrl(kind) }); } catch (e) { res = { ok: false, error: String(e) }; }
@@ -715,14 +785,19 @@
     sendToEngine({ type: 'embed-started', kind });
     log('helper background tab started', res.tabId);
   }
+  // Progress here means captured audio reaching the engine (or an ad running its course), never
+  // a mere sign of life: a helper whose player is alive but fetching nothing is stuck and is
+  // replaced like any other.
   function checkHelper() {
     const h = S.helper;
-    if (!h || h.opening) return;
-    if (S.helperThrottled) { h.started = Date.now(); h.lastProgress = Date.now(); return; } // idle by our own request
+    if (!h) return;
     const now = Date.now();
+    if (h.opening) { if (now - h.started > 15000) failHelper('the background tab did not open'); return; }
+    if (S.helperThrottled) { h.started = now; h.lastProgress = now; return; } // idle by our own request
+    if (h.ended) return; // nothing more to deliver; capture-complete removes it once decoding is done
     if (!h.alive && now - h.started > 15000) return failHelper('the helper player page never loaded');
     if (h.alive && !h.progress && now - h.started > 30000) return failHelper('the helper player did not start' + (h.dom ? ' (' + describeDom(h.dom) + ')' : ''));
-    if (h.progress && now - h.lastProgress > 60000) return failHelper('the helper player stalled');
+    if (h.progress && now - h.lastProgress > 45000) return failHelper('the helper player stopped delivering audio');
   }
   function describeDom(d) {
     if (!d) return '';
@@ -736,6 +811,9 @@
     removeHelper();
     S.helperFailures = (S.helperFailures || []).concat(`${h.kind}: ${reason}`);
     if (h.stage + 1 < HELPER_STAGES.length) { startHelper(h.stage + 1); return; }
+    // Every kind of helper failed. Wanting one still would restart the ladder on the next heartbeat,
+    // opening and closing a background tab every couple of minutes; wait a good while instead.
+    S.helperWanted = false; S.helperRetryAt = Date.now() + HELPER_RETRY_MS;
     sendToEngine({ type: 'embed-failed', reason: S.helperFailures.join(' · ') });
   }
   function removeHelper() {
@@ -778,11 +856,16 @@
 
   async function init() {
     await loadSettings();
+    repairQualityPreference();
     // Arm the page-world hook before waiting for anything else. YouTube can append the stream's
     // first segments -- the ones carrying the codec headers -- before DOMContentLoaded, and a
     // stream captured without them can never be decoded, which showed up as a permanent 0%.
     cmdHook({ t: 'arm', on: !!S.settings.enabled && !!currentVideoId() });
     cmdHook({ t: 'capture', on: !!S.settings.enabled && !!currentVideoId() });
+    // The moment a navigation begins, the session for the video being left ends: YouTube may
+    // start the next video in the same element within the same second, and a session still
+    // attached would take its clock from the new video and play the old one's audio over it.
+    document.addEventListener('yt-navigate-start', () => { if (S.sessionActive) { log('navigation started; ending the session'); stopSession(); } }, true);
     document.addEventListener('yt-navigate-finish', () => { onLocationMaybeChanged(); }, true);
     document.addEventListener('yt-page-data-updated', () => { onLocationMaybeChanged(); }, true);
     setInterval(onLocationMaybeChanged, 1000);

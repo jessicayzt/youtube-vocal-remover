@@ -9,7 +9,7 @@ from the repository root (the store requires `manifest.json` at the root of the 
 1. Register at https://chrome.google.com/webstore/devconsole with the Google account that should
    own the listing. There is a one-time developer registration fee (US$5 at the time of writing).
    On the **Account** page set and verify a contact email; publishing is blocked until it is verified.
-2. **New item**, upload `dist/youtube-vocal-remover-0.1.0.zip`.
+2. **New item**, upload `dist/youtube-vocal-remover-0.1.1.zip`.
 3. **Store listing** tab: the texts below, the screenshots, the promo tile.
 4. **Privacy practices** tab: the single purpose, the permission justifications, remote code = no,
    the data-usage boxes and certifications, the privacy policy URL.

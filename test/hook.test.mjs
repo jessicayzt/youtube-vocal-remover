@@ -27,6 +27,7 @@ var __player = {
   mute: () => { __playerMuted = true; }, isMuted: () => __playerMuted,
   playVideo: () => __video.play(), pauseVideo: () => __video.pause(),
 };
+var localStorage = { _s: {}, getItem(k) { return k in this._s ? this._s[k] : null; }, setItem(k, v) { this._s[k] = String(v); }, removeItem(k) { delete this._s[k]; } };
 var document = {
   addEventListener(t, f) { (__docL[t] = __docL[t] || []).push(f); }, removeEventListener() {},
   getElementById(id) { return id === 'movie_player' ? __player : null; },
@@ -139,6 +140,29 @@ test('the isolated-world content script never reports the element volume', () =>
   assert.match(stripped, /m\.t === 'vol'[\s\S]{0,120}volume: m\.volume/, 'it forwards the page-world report instead');
 });
 
+// YouTube stores the quality a player was set to in the origin's localStorage and applies it to
+// the next video from that origin. A helper on www.youtube.com shares it with the watched page.
+test("the helper's quality request never becomes the person's saved preference", () => {
+  const w = world('#vrx-helper');
+  w.run(`
+    localStorage.setItem('yt-player-quality', 'PREF-1080');
+    __player.setPlaybackQualityRange = (a, b) => { __quality = a + '/' + b; localStorage.setItem('yt-player-quality', 'PREF-144'); };
+  `);
+  w.tick();
+  assert.equal(w.quality(), 'tiny/tiny', 'the request itself is made');
+  assert.equal(w.run("localStorage.getItem('yt-player-quality')"), 'PREF-1080', 'and the preference is back to what it was');
+  w.run("localStorage.setItem('yt-player-quality', 'PREF-144')"); // the player writes it again later
+  w.tick();
+  assert.equal(w.run("localStorage.getItem('yt-player-quality')"), 'PREF-1080', 'every tick puts it back');
+});
+
+test("a page with no saved preference is left with none", () => {
+  const w = world('#vrx-helper');
+  w.run("__player.setPlaybackQualityRange = (a, b) => { __quality = a + '/' + b; localStorage.setItem('yt-player-quality', 'PREF-144'); };");
+  w.tick();
+  assert.equal(w.run("localStorage.getItem('yt-player-quality')"), null, 'removed, so quality stays automatic');
+});
+
 // The helper is a second copy of the same video. Everything here exists to keep it from
 // competing with the player the person is actually watching, and from looking to YouTube like a
 // player in trouble.
@@ -160,7 +184,7 @@ test('the helper fetches by seeking to the buffered end, and finishes when the t
   assert.equal(w.currentTime(), 0, 'the buffer may still be growing: no seek yet');
   await new Promise((r) => setTimeout(r, 900)); // the buffered end has not moved: the player is done fetching
   w.tick();
-  assert.equal(w.currentTime(), 50, 'seeks to 10 s short of the buffered end, keeping runway');
+  assert.equal(w.currentTime(), 57, 'seeks to 3 s short of the buffered end, keeping a little runway');
   assert.equal(w.embedEvents().pop(), 'progress');
   w.run('__video.buffered = { length: 1, start: () => 0, end: () => 299.8 };'); // the player fills the rest from there
   w.tick();
@@ -404,6 +428,65 @@ test('the hook reports which video the player is on and how long it says it is',
   pong = JSON.parse(w.run('JSON.stringify(__posted.filter((p) => p.t === "pong").pop())'));
   assert.equal(pong.videoId, 'abc');
   assert.equal(pong.duration, 212.4);
+});
+
+// A playlist's "next" reuses the MediaSource and its SourceBuffers for the preloaded next video.
+// The buffer's kept start then belonged to the previous video, and replaying it put that video's
+// first seconds at the start of the next one. A new initialization segment starts a new media.
+test('a new initialization segment in a reused SourceBuffer starts the kept data over', () => {
+  const w = world('');
+  w.cmd({ t: 'arm', on: true });
+  w.cmd({ t: 'capture', on: true });
+  w.run(`
+    var ms = new MediaSource();
+    var sb = ms.addSourceBuffer('audio/webm; codecs="opus"');
+    sb.appendBuffer(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 1, 1, 1, 1]).buffer); // video A: EBML header (init)
+    sb.appendBuffer(new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 2, 2, 2, 2]).buffer); // a cluster
+  `);
+  w.cmd({ t: 'capture', on: false }); // the session for video A ends
+  w.run(`
+    sb.abort();
+    ms.duration = 200; // YouTube sets the next video's length ...
+    sb.appendBuffer(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 9, 9, 9, 9]).buffer); // ... and appends video B's init into the same buffer
+    sb.appendBuffer(new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 8, 8, 8, 8]).buffer);
+  `);
+  w.cmd({ t: 'capture', on: true }); // the session for video B begins
+  const got = w.segBytes().slice(2);
+  assert.deepEqual(got, [[0x1a, 0x45, 0xdf, 0xa3, 9, 9, 9, 9], [0x1f, 0x43, 0xb6, 0x75, 8, 8, 8, 8]], "B's session receives B's start and nothing of A");
+  const durations = JSON.parse(w.run('JSON.stringify(__posted.filter((p) => p.t === "seg").map((p) => p.msDuration))'));
+  assert.deepEqual(durations, [300, 300, 200, 200], 'each append carries the length its media had when it was appended');
+  w.cmd({ t: 'heads' });
+  assert.deepEqual(w.segBytes().slice(4), got, "the headers on request are B's, not A's");
+});
+
+test('the same initialization segment sent again is the same media: nothing kept is dropped', () => {
+  const w = world('');
+  w.run(`
+    var ms = new MediaSource();
+    var sb = ms.addSourceBuffer('audio/webm; codecs="opus"');
+    sb.appendBuffer(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 5, 5, 5, 5]).buffer); // init
+    sb.appendBuffer(new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 6, 6, 6, 6]).buffer); // cluster
+    sb.appendBuffer(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 5, 5, 5, 5]).buffer); // the same init, re-announced
+    sb.appendBuffer(new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 7, 7, 7, 7]).buffer);
+  `);
+  w.cmd({ t: 'capture', on: true });
+  assert.equal(w.segBytes().length, 4, 'everything kept is handed over');
+  assert.ok(!w.kinds().includes('sb-reset'), 'and no restart is reported');
+});
+
+test('a new initialization segment while capture is on tells the engine the stream restarted', () => {
+  const w = world('');
+  w.cmd({ t: 'arm', on: true });
+  w.cmd({ t: 'capture', on: true });
+  w.run(`
+    var ms = new MediaSource();
+    var sb = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    sb.appendBuffer(new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 1, 1]).buffer); // ftyp: init
+    sb.appendBuffer(new Uint8Array([0, 0, 0, 24, 0x6d, 0x6f, 0x6f, 0x66, 2, 2]).buffer); // moof: media
+    sb.appendBuffer(new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 3, 3]).buffer); // ftyp again: a new media
+  `);
+  const seq = w.kinds().filter((k) => k === 'seg' || k === 'sb-reset');
+  assert.deepEqual(seq, ['seg', 'seg', 'sb-reset', 'seg'], 'the parser is reset before the new media');
 });
 
 // `ad-showing` is also set by overlay and banner ads while the content keeps playing. Treating
