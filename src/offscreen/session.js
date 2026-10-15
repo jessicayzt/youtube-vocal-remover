@@ -1,7 +1,7 @@
 // One Session per YouTube video: owns the shared PCM stores, capture ingestion, incremental
 // decoding, the separation job, playback sync/takeover decisions, cache persistence and the
 // status broadcast to the controller content script.
-import { TrackBuffers, SAMPLE_RATE, BLOCK_SIZE } from './buffers.js';
+import { TrackBuffers, SAMPLE_RATE, BLOCK_SIZE, INT16_SCALE } from './buffers.js';
 import { SegmentStore, IncrementalDecoder } from './decoder.js';
 
 const R = globalThis.VRX.ranges;
@@ -15,14 +15,23 @@ const b64 = globalThis.VRX.b64;
  * never re-fetched, and the separation of silence is silence -- whole tracks came back mute.
  * v4: ad audio reached the mixture (a flagged append was let through when its MediaSource reported
  * the video's own length) and was cached as if it were the video's own.
+ * v5: the first release replayed the previous playlist video's stream start into the next video,
+ * so a cached track may begin with another video's audio ("stale audio leaking through").
  */
-export const CACHE_VERSION = 'v4';
+export const CACHE_VERSION = 'v5';
 const STATE_INTERVAL_MS = 250;
 const PERSIST_INTERVAL_MS = 180000; // a persist copies the whole track: for an hour of audio, well over a gigabyte
 const QUALITY = {
   balanced: { overlap: 0.25, denoise: false },
   high: { overlap: 0.5, denoise: true },
 };
+
+/** Resolves with the promise's value, or undefined after `ms`; the timer never outlives the wait. */
+function withTimeout(promise, ms) {
+  let timer = null;
+  const late = new Promise((resolve) => { timer = setTimeout(resolve, ms); if (timer && typeof timer.unref === 'function') timer.unref(); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
 
 function describeHelper(kind) {
   return kind === 'embed-nocookie' ? 'cookieless embed' : kind === 'embed-iframe' ? 'embed' : kind === 'watch-iframe' ? 'hidden watch page' : kind === 'watch-tab' ? 'background tab' : 'helper player';
@@ -65,22 +74,35 @@ export class Session {
 
   forwardToCapture(msg) { for (const port of this.capturePorts.keys()) { try { port.postMessage(msg); } catch (e) { /* port gone */ } } }
 
+  /**
+   * What the worklet plays with. The gain is zero whenever this session does not hold the page's
+   * audio: the page is then audible on its own, and anything we emitted on top of it (an ad
+   * break, a silence hand-back, the moment the player moves to another element) was two copies
+   * of the same audio a few milliseconds apart, which the ear hears as detuned.
+   */
   playbackParams() {
-    return { vocalLevel: this.settings.vocalLevel, semitones: this.settings.semitones, gain: this.muted ? 0 : this.volume };
+    return { vocalLevel: this.settings.vocalLevel, semitones: this.settings.semitones, gain: this.muted || !this.takeover ? 0 : this.volume };
   }
 
   // ------------------------------------------------------------------ controller lifecycle
   async attachController(port, hello, playerError = null) {
     this.controller = port;
     this.lastUsed = Date.now();
+    const prevSettings = this.settings;
     if (hello.settings) this.settings = { ...this.settings, ...hello.settings };
     if (hello.title) this.title = hello.title;
     // a fresh attach (Retry) clears an earlier processing error; a dead audio output does not go away
     this.error = playerError;
     if (!this.cacheLoaded) this.cacheLoaded = this.loadFromCache();
     // a cache that does not answer must not hold the session hostage: go ahead without it
-    await Promise.race([this.cacheLoaded, new Promise((resolve) => setTimeout(resolve, 20000))]);
+    await withTimeout(this.cacheLoaded, 20000);
     if (this.controller !== port) return;
+    // The settings the page brings are a settings change like any other. This session may have
+    // lived on in the engine since its last controller (the engine keeps a few), with the transpose
+    // or model changed from elsewhere meanwhile: merged silently, the worklet kept transposing by
+    // the old amount while the panel said 0, and a changed model would have had the old model's
+    // output saved under its name.
+    this.settingsChanged(prevSettings);
     // whatever goes wrong below, the controller must hear 'plan' (it holds captured audio until it
     // does) and the status timer must run (or the panel stays on "Starting…" with no way to tell)
     try { this.engine.setActive(this); } catch (e) { console.error('[VocalRemover] could not activate the session', e); }
@@ -129,8 +151,9 @@ export class Session {
   }
 
   startTimers() {
-    if (!this.stateTimer) this.stateTimer = setInterval(() => this.broadcastState(false), STATE_INTERVAL_MS);
-    if (!this.persistTimer) this.persistTimer = setInterval(() => this.persist(), PERSIST_INTERVAL_MS);
+    const unref = (t) => { if (t && typeof t.unref === 'function') t.unref(); return t; }; // Node (tests): never keep the process alive
+    if (!this.stateTimer) this.stateTimer = unref(setInterval(() => this.broadcastState(false), STATE_INTERVAL_MS));
+    if (!this.persistTimer) this.persistTimer = unref(setInterval(() => this.persist(), PERSIST_INTERVAL_MS));
   }
   stopTimers() {
     if (this.stateTimer) { clearInterval(this.stateTimer); this.stateTimer = null; }
@@ -206,11 +229,16 @@ export class Session {
   applySettings(next) {
     const prev = this.settings;
     this.settings = { ...prev, ...next };
+    this.settingsChanged(prev);
+    this.broadcastState(true);
+  }
+
+  /** Everything that has to follow a change of this.settings from `prev`. */
+  settingsChanged(prev) {
     if (prev.modelId !== this.settings.modelId || prev.quality !== this.settings.quality) this.switchOutput(prev);
     if (!this.settings.enabled) { this.setTakeover(false); this.stopPlayback(); this.engine.separator.cancel(this); }
     else this.ensureProcessing();
     this.pushParams();
-    this.broadcastState(true);
   }
 
   pushParams() {
@@ -268,6 +296,7 @@ export class Session {
     if (this.takeover === on) return;
     this.takeover = on;
     this.send({ type: 'takeover', on });
+    this.pushParams(); // the worklet is audible only while we hold the page's audio
   }
 
   onDeactivated() { this.setTakeover(false); }
@@ -337,13 +366,68 @@ export class Session {
     if (!this.silentSince) { this.silentSince = now; return; }
     if (now - this.silentSince < 1500) return; // a real quiet passage is allowed
     this.silentSince = 0;
+    if (gate.silenceCause(info) === 'after-mix') {
+      this.handBack(now, `output was silenced after mixing (gain ${info.gain.toFixed(2)}, envelope ${info.envelope.toFixed(2)})`, info);
+      return;
+    }
+    // What we read from the stores was silent. Three different things look like that, and only
+    // one of them is a reason to let the page's audio through.
+    const peaks = this.storePeaks(this.currentPosition(), 1.5);
+    const kind = gate.storeSilence(peaks);
+    if (kind === 'inst-quiet') { this.silentReason = null; return; } // vocals alone here: silence is the karaoke-correct output
+    if (kind === 'inst-zero') {
+      // the mixture has audio and the model's output for it is exactly nothing: a failed inference
+      // stored as finished. Marked green, it played as silence, and the hand-back then let the
+      // original -- vocals and all -- through under the green bar. Redo it; original meanwhile.
+      this.reprocess(peaks.blocks, 'the model produced no audio for this part');
+      this.handBack(now, 'the processed audio for this part was empty; it is being processed again', info);
+      return;
+    }
+    this.handBack(now, 'the audio decoded for this part is itself silent', info);
+  }
+
+  handBack(now, reason, info) {
     this.silenceUntil = now + 10000;
-    this.silentReason = gate.silenceCause(info) === 'after-mix'
-      ? `output was silenced after mixing (gain ${info.gain.toFixed(2)}, envelope ${info.envelope.toFixed(2)})`
-      : 'the audio decoded for this part is itself silent';
-    console.warn('[VocalRemover] handing audio back to the page:', this.silentReason, info);
+    this.silentReason = reason;
+    console.warn('[VocalRemover] handing audio back to the page:', reason, info);
     this.setTakeover(false);
     this.broadcastState(true);
+  }
+
+  /** Peak levels (0..1) of mixture and instrumental over the processed blocks around `at` seconds. */
+  storePeaks(at, spanSeconds) {
+    const b = this.buffers;
+    const b0 = Math.max(0, Math.floor(((at - 0.2) * SAMPLE_RATE) / BLOCK_SIZE));
+    const b1 = Math.min(b.numBlocks - 1, Math.floor(((at + spanSeconds) * SAMPLE_RATE) / BLOCK_SIZE));
+    let mixPeak = 0, instPeak = 0, green = 0;
+    for (let blk = b0; blk <= b1; blk++) {
+      if (!b.instReady[blk]) continue;
+      green++;
+      const s = blk * BLOCK_SIZE, e = Math.min(b.totalSamples, s + BLOCK_SIZE);
+      for (let x = s; x < e; x++) {
+        const ml = Math.abs(b.mixL[x]), mr = Math.abs(b.mixR[x]), il = Math.abs(b.instL[x]), ir = Math.abs(b.instR[x]);
+        if (ml > mixPeak) mixPeak = ml;
+        if (mr > mixPeak) mixPeak = mr;
+        if (il > instPeak) instPeak = il;
+        if (ir > instPeak) instPeak = ir;
+      }
+    }
+    return { mixPeak: mixPeak / INT16_SCALE, instPeak: instPeak / INT16_SCALE, blocks: [b0, b1], green };
+  }
+
+  /** Blocks whose stored instrumental is wrong go back to unprocessed, and the job is restarted so the worker redoes them. */
+  reprocess([b0, b1], reason) {
+    const now = Date.now();
+    if (now - (this.lastReprocessAt || 0) < 5000) return;
+    this.lastReprocessAt = now;
+    this.reprocessCount = (this.reprocessCount || 0) + 1;
+    console.warn('[VocalRemover] reprocessing blocks', b0, '-', b1, ':', reason);
+    this.buffers.instReady.fill(0, b0, b1 + 1);
+    if (this.pushedInst) this.pushedInst.fill(0, b0, b1 + 1);
+    this.dirtyInst = true; this.fromCache = false;
+    // twice is a pattern: the backend is not to be trusted on this machine
+    if (this.reprocessCount >= 2) this.engine.separator.suspectBackend(reason);
+    this.engine.separator.reprocess(this);
   }
 
   // ------------------------------------------------------------------ processing

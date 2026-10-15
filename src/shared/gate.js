@@ -47,6 +47,21 @@
     return info && info.srcPeak >= SILENT_PEAK ? 'after-mix' : 'source';
   }
 
+  /**
+   * What silence read from the stores means. `mixPeak` and `instPeak` are the peak levels (0..1)
+   * over the processed blocks around the listener.
+   *   mix-silent  the mixture itself is silent there: true silence, or a gap that had to be filled
+   *   inst-zero   the mixture has audio and the instrumental is exactly nothing: a failed inference
+   *               stored as if finished (a GPU short of memory can fail without a word)
+   *   inst-quiet  the instrumental is merely quiet: a real passage of vocals alone, for which
+   *               silence is the right output and the page's audio would be the wrong one
+   */
+  function storeSilence(peaks) {
+    if (!peaks || !(peaks.mixPeak >= SILENT_PEAK)) return 'mix-silent';
+    if (peaks.instPeak === 0) return 'inst-zero';
+    return 'inst-quiet';
+  }
+
   root.VRX = root.VRX || {};
-  root.VRX.gate = { playerSettled, outputIsSilent, silenceCause, SILENT_PEAK };
+  root.VRX.gate = { playerSettled, outputIsSilent, silenceCause, storeSilence, SILENT_PEAK };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

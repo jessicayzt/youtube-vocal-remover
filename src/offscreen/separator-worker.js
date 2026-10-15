@@ -64,6 +64,36 @@ async function getSession(modelId) {
   return entry;
 }
 
+// A GPU short of memory can fail without a word: the run resolves and the output is nothing, or
+// NaN. Before a backend's first chunk it is tried on a signal that must come back with audio in
+// it, and every chunk's output has to be finite. Either failing is an error, which the engine
+// answers by retrying, then by switching to WebAssembly.
+function assertFinite(a, what) {
+  for (let i = 0; i < a.length; i++) { const v = a[i]; if (v !== v || v === Infinity || v === -Infinity) throw new Error(`the model produced non-finite ${what}`); }
+}
+function energy(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * a[i]; return s; }
+
+async function probeBackend(entry, grid, stft) {
+  const { session, spec, inputName, outputName, backend } = entry;
+  const T = spec.dimT, dimF = spec.dimF;
+  const cl = new Float32Array(grid.chunkSize), cr = new Float32Array(grid.chunkSize);
+  for (let i = 0; i < cl.length; i++) {
+    const t = i / 44100;
+    const v = 0.3 * Math.sin(2 * Math.PI * 110 * t) + 0.2 * Math.sin(2 * Math.PI * 440 * t) + 0.1 * Math.sin(2 * Math.PI * 1760 * t);
+    cl[i] = v; cr[i] = v;
+  }
+  const specBuf = new Float32Array(4 * dimF * T);
+  stft.forward([cl, cr], specBuf, 3);
+  const r = await session.run({ [inputName]: new ort.Tensor('float32', specBuf, [1, 4, dimF, T]) });
+  const out = r[outputName].data;
+  assertFinite(out, 'output in its self-check');
+  const oL = new Float32Array(grid.chunkSize), oR = new Float32Array(grid.chunkSize);
+  stft.inverse(out, T, [oL, oR]);
+  const eIn = energy(cl) + energy(cr), eOut = energy(oL) + energy(oR);
+  if (!(eOut > eIn * 1e-6)) throw new Error(`backend self-check failed: the model returned no audio for a test signal (${backend})`);
+  post({ type: 'log', message: `backend self-check passed on ${backend} (output/input energy ${(eOut / eIn).toFixed(3)})` });
+}
+
 function startJob(m) {
   const prev = job;
   const j = {
@@ -83,12 +113,15 @@ function startJob(m) {
 
 async function runJob(j, m) {
   post({ type: 'loading', jobId: j.id });
-  const { spec, session, backend, inputName, outputName } = await getSession(m.modelId);
+  const entry = await getSession(m.modelId);
+  const { spec, session, backend, inputName, outputName } = entry;
   if (j.cancelled) { post({ type: 'cancelled', jobId: j.id }); return; }
-  post({ type: 'backend', jobId: j.id, backend, threads: backend === 'wasm' ? ort.env.wasm.numThreads : null });
 
   const grid = new MdxGrid({ nFft: spec.nFft, hop: spec.hop, dimT: spec.dimT, overlap: m.overlap, totalSamples: m.totalSamples, blockSize: m.blockSize });
   const stft = new STFT({ nFft: spec.nFft, hop: spec.hop, dimF: spec.dimF });
+  if (!entry.probed) { await probeBackend(entry, grid, stft); entry.probed = true; }
+  if (j.cancelled) { post({ type: 'cancelled', jobId: j.id }); return; }
+  post({ type: 'backend', jobId: j.id, backend, threads: backend === 'wasm' ? ort.env.wasm.numThreads : null });
   const mixL = new Int16Array(m.mixL), mixR = new Int16Array(m.mixR);
   const instL = new Int16Array(m.instL), instR = new Int16Array(m.instR);
   const mixReady = new Uint8Array(m.mixReady), instReady = new Uint8Array(m.instReady);
@@ -186,6 +219,7 @@ async function runJob(j, m) {
     }
     const oL = new Float32Array(grid.chunkSize), oR = new Float32Array(grid.chunkSize);
     stft.inverse(outData, T, [oL, oR]);
+    assertFinite(oL, 'output'); assertFinite(oR, 'output');
     acc.addChunkOutput(k, oL, oR);
     const dt = (performance.now() - t0) / 1000;
     const inst = (grid.step / 44100) / Math.max(dt, 1e-3);

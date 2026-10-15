@@ -100,6 +100,19 @@ class SeparatorClient {
     });
   }
 
+  /** The session has unmarked blocks it wants redone: end its running job; the next one re-reads the bitmap. */
+  reprocess(session) {
+    this.cancelAndWait(session).then(() => { if (session.needsProcessing) this.request(session); });
+  }
+
+  /** Empty output more than once is a backend failing without a word: WebAssembly from here on. */
+  suspectBackend(reason) {
+    if (this.forceWasm) return;
+    this.forceWasm = true;
+    console.warn('[VocalRemover] the separation backend produced empty output repeatedly; switching to WebAssembly:', reason);
+    this.restartWorker('backend suspected: ' + reason);
+  }
+
   _settle(session) {
     const w = this.waiters.get(session);
     if (!w) return;

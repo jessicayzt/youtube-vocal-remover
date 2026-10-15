@@ -9,6 +9,7 @@ vm.runInContext(readFileSync(new URL('../src/shared/gate.js', import.meta.url), 
 const settled = (state, minBuffer = 8) => vm.runInContext('VRX.gate.playerSettled', ctx)(state, minBuffer);
 const isSilent = (info, takeover = true) => vm.runInContext('VRX.gate.outputIsSilent', ctx)(info, takeover);
 const cause = (info) => vm.runInContext('VRX.gate.silenceCause', ctx)(info);
+const storeSilence = (peaks) => vm.runInContext('VRX.gate.storeSilence', ctx)(peaks);
 
 // The regression. At page load the player is paused because it has not started yet, and a gate
 // that treated "paused" as safe opened immediately -- launching the engine straight into the
@@ -64,6 +65,15 @@ test('holding the audio while emitting nothing counts as silent', () => {
   assert.equal(isSilent({ ...quiet, hasBuffers: false }, true), false, 'nothing loaded yet');
   assert.equal(isSilent({ ...quiet, outPeak: 0.2 }, true), false, 'audible');
   assert.equal(isSilent(null, true), false);
+});
+
+// Silence read from the stores is three different things, and only one of them should let the
+// page's audio -- vocals and all -- through under a green bar.
+test('silence from the stores is told apart by what the stores hold', () => {
+  assert.equal(storeSilence({ mixPeak: 0, instPeak: 0 }), 'mix-silent', 'nothing to separate: a gap or true silence');
+  assert.equal(storeSilence({ mixPeak: 0.5, instPeak: 0 }), 'inst-zero', 'audio in, exactly nothing out: a failed inference');
+  assert.equal(storeSilence({ mixPeak: 0.5, instPeak: 0.00005 }), 'inst-quiet', 'a trace of output: a quiet instrumental, which is right');
+  assert.equal(storeSilence(null), 'mix-silent');
 });
 
 test('the two peaks say which side went quiet', () => {

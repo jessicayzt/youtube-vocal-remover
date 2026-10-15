@@ -138,6 +138,24 @@ test('transpose shifts pitch and playback rate does not', () => {
   assert.ok(Math.abs(f1 - 440) < 25, `1.5x keeps 440 Hz, got ${f1.toFixed(1)}`);
 });
 
+// The regression report: transposed audio heard with the setting back at 0. Once the crossfade
+// out of the stretch path is over, the output has to be the untouched samples, bit for bit.
+test('transpose back to 0 returns to bit-exact passthrough', () => {
+  setReady([0, nb], [0, nb]);
+  proc.onMessage({ type: 'params', params: { vocalLevel: 1, semitones: 3, gain: 1 } });
+  proc.onMessage({ type: 'sync', mediaTime: 0.3, ctxTime: 110, rate: 1, playing: true });
+  for (let i = 0; i < 40; i++) render(110 + i * 128 / SR); // well into the stretch path
+  assert.ok(proc.stretchMix === 1, 'stretching');
+  proc.onMessage({ type: 'params', params: { semitones: 0 } });
+  const ctx2 = 110 + 40 * 128 / SR;
+  proc.onMessage({ type: 'sync', mediaTime: 0.3, ctxTime: ctx2, rate: 1, playing: true }); // re-anchor so the sampled block is known
+  for (let i = 0; i < 20; i++) render(ctx2 + i * 128 / SR); // the 1024-sample crossfade is 8 blocks; leave margin
+  assert.equal(proc.stretchMix, 0, 'the stretch path is fully out');
+  const out = render(ctx2 + 20 * 128 / SR);
+  const at = Math.round((0.3 + 20 * 128 / SR) * SR);
+  assert.ok(maxDiff(out, mixL, at) < 1e-6, 'nothing of the stretcher remains in the output');
+});
+
 test('pausing fades out to silence', () => {
   proc.onMessage({ type: 'sync', mediaTime: 0.6, ctxTime: 120, rate: 1, playing: false });
   for (let i = 0; i < 6; i++) render(120 + i * 128 / SR);

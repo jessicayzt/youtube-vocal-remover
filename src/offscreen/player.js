@@ -55,9 +55,11 @@ export class Player {
 
   bind(session) {
     if (!this.ready) return;
-    if (this.bound === session) return;
-    this.bound = session;
-    this.node.port.postMessage({ type: 'buffers', ...session.buffers.shareable() });
+    if (this.bound !== session) {
+      this.bound = session;
+      this.node.port.postMessage({ type: 'buffers', ...session.buffers.shareable() });
+    }
+    // always: a session re-activated with settings changed meanwhile must not keep playing with the old ones
     this.setParams(session.playbackParams());
   }
 
