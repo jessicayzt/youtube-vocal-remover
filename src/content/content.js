@@ -174,7 +174,10 @@
     qualityPrefBefore: undefined,
   };
 
-  const wall = () => performance.timeOrigin + performance.now();
+  // Date.now(), not performance.timeOrigin + performance.now(): that clock is per document and stops
+  // while the computer sleeps, so the engine's long-lived document drifted from every page loaded
+  // after a sleep, by the length of the sleep (see heardCtxTime in player.js).
+  const wall = () => Date.now();
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   async function waitFor(fn, timeoutMs = 15000, interval = 250) {
     const t0 = Date.now();

@@ -17,8 +17,11 @@ const b64 = globalThis.VRX.b64;
  * the video's own length) and was cached as if it were the video's own.
  * v5: the first release replayed the previous playlist video's stream start into the next video,
  * so a cached track may begin with another video's audio ("stale audio leaking through").
+ * v6: instrumentals were saved with the ready bitmap copied after the samples, so blocks finished
+ * during the copy were saved ready and empty; and a backend failing without an error had its
+ * empty or recycled output stored as finished. Either plays as silence under a green bar.
  */
-export const CACHE_VERSION = 'v5';
+export const CACHE_VERSION = 'v6';
 const STATE_INTERVAL_MS = 250;
 const PERSIST_INTERVAL_MS = 180000; // a persist copies the whole track: for an hour of audio, well over a gigabyte
 const QUALITY = {
@@ -31,6 +34,44 @@ function withTimeout(promise, ms) {
   let timer = null;
   const late = new Promise((resolve) => { timer = setTimeout(resolve, ms); if (timer && typeof timer.unref === 'function') timer.unref(); });
   return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+const OUTPUT_STALL_MS = 1500;          // playing, holding the page audio, no report from the playback thread for this long: it is not rendering
+const CLOCK_TOLERANCE_S = 1.5;         // the playback thread reads ahead of the video by its output latency, never by this much
+const FAILED_MIN_AUDIBLE_BLOCKS = 22;  // about 0.5 s of exactly-zero instrumental under an audible mixture
+const FAILED_MIN_BLIND_BLOCKS = 130;   // about 3 s of exactly-zero instrumental with no mixture to compare it with
+const AUDIBLE_MIX_PEAK = 22;           // about -60 dBFS in the Int16 stores
+const BLOB_SLICE = 1 << 20;            // samples copied at a time when a store is saved
+
+/** A copy of a ready bitmap read with atomic loads: every block it shows ready has its samples in place. */
+function snapshotBitmap(bitmap) {
+  const out = new Uint8Array(bitmap.length);
+  for (let i = 0; i < bitmap.length; i++) out[i] = Atomics.load(bitmap, i);
+  return out;
+}
+
+/**
+ * A store as a Blob, copied a slice at a time. A whole-track copy doubled the engine's memory for
+ * the length of a save -- for an hour of audio, over a gigabyte -- which on a machine short of
+ * memory is what gets the engine's process killed.
+ */
+function blobOf(view) {
+  const parts = [];
+  for (let o = 0; o < view.length; o += BLOB_SLICE) parts.push(new Blob([view.slice(o, Math.min(view.length, o + BLOB_SLICE))]));
+  return new Blob(parts);
+}
+
+function blockPeak(L, R, blk, total) {
+  const s = blk * BLOCK_SIZE, e = Math.min(total, s + BLOCK_SIZE);
+  let p = 0;
+  for (let x = s; x < e; x++) { const l = L[x] < 0 ? -L[x] : L[x], r = R[x] < 0 ? -R[x] : R[x]; if (l > p) p = l; if (r > p) p = r; }
+  return p;
+}
+
+function blockIsZero(L, R, blk, total) {
+  const s = blk * BLOCK_SIZE, e = Math.min(total, s + BLOCK_SIZE);
+  for (let x = s; x < e; x++) if (L[x] !== 0 || R[x] !== 0) return false;
+  return true;
 }
 
 function describeHelper(kind) {
@@ -63,10 +104,14 @@ export class Session {
     this.cacheLoaded = null;
     this.lastJobEventAt = 0; this.lastPacePlaying = null;
     this.mainAd = false; this.switching = false;
+    this.takeoverSince = 0; this.playingSince = 0; this.stallSeenAt = 0; this.clockMisses = 0; this.reprocessCount = 0;
+    this.outputFor = null; // { modelId, quality } of the instrumental in the stores, once known
   }
 
   get instKey() { return `${CACHE_VERSION}|${this.videoId}|${this.settings.modelId}|${this.settings.quality}`; }
   get mixKey() { return `${CACHE_VERSION}|${this.videoId}|mix`; }
+  /** The cache key of what the instrumental stores actually hold (they lag the settings during a switch). */
+  get outputKey() { const o = this.outputFor || this.settings; return `${CACHE_VERSION}|${this.videoId}|${o.modelId}|${o.quality}`; }
   get complete() { return this.buffers.countReady(this.buffers.instReady) === this.buffers.numBlocks; }
   get needsProcessing() { return this.settings.enabled && !this.complete && !this.error && !this.switching; }
 
@@ -91,8 +136,11 @@ export class Session {
     const prevSettings = this.settings;
     if (hello.settings) this.settings = { ...this.settings, ...hello.settings };
     if (hello.title) this.title = hello.title;
-    // a fresh attach (Retry) clears an earlier processing error; a dead audio output does not go away
-    this.error = playerError;
+    this.error = null; // a fresh attach (Retry) clears an earlier processing error
+    // Audio output that would not start no longer stops processing: separating needs no speakers,
+    // and the output is retried while the video plays. Until then the original plays, and the
+    // panel says why.
+    this.outputError = playerError;
     if (!this.cacheLoaded) this.cacheLoaded = this.loadFromCache();
     // a cache that does not answer must not hold the session hostage: go ahead without it
     await withTimeout(this.cacheLoaded, 20000);
@@ -134,7 +182,7 @@ export class Session {
    */
   stopPlayback() {
     if (!this.lastSync || !this.lastSync.playing) return;
-    const stopped = { ...this.lastSync, mediaTime: this.currentPosition(), wall: performance.timeOrigin + performance.now(), playing: false };
+    const stopped = { ...this.lastSync, mediaTime: this.currentPosition(), wall: Date.now(), playing: false };
     this.lastSync = stopped;
     if (this.engine.active === this) this.engine.player.sync(this, stopped);
   }
@@ -234,8 +282,13 @@ export class Session {
   }
 
   /** Everything that has to follow a change of this.settings from `prev`. */
-  settingsChanged(prev) {
-    if (prev.modelId !== this.settings.modelId || prev.quality !== this.settings.quality) this.switchOutput(prev);
+  settingsChanged() {
+    // Compared with what the stores hold, not with the previous settings: on a session's first
+    // attach the previous settings are the engine's built-in defaults, and a page using another
+    // model or quality had the instrumental it had just loaded from the cache wiped and loaded
+    // again -- and anything unsaved filed under the default model's name.
+    const out = this.outputFor;
+    if (out && !this.switching && (out.modelId !== this.settings.modelId || out.quality !== this.settings.quality)) this.switchOutput(out);
     if (!this.settings.enabled) { this.setTakeover(false); this.stopPlayback(); this.engine.separator.cancel(this); }
     else this.ensureProcessing();
     this.pushParams();
@@ -246,7 +299,9 @@ export class Session {
   }
 
   onSync(m) {
+    const prev = this.lastSync;
     this.lastSync = m;
+    if (m.playing && !(prev && prev.playing)) this.playingSince = Date.now();
     if (m.ad && !this.mainAd) this.store.onAdStart('main:'); // an ad began: take back what it may have appended unflagged
     this.mainAd = !!m.ad;
     if (!Number.isFinite(m.mediaTime)) return;
@@ -276,14 +331,23 @@ export class Session {
     const m = this.lastSync;
     if (!m) return 0;
     if (!m.playing) return m.mediaTime;
-    const elapsed = (performance.timeOrigin + performance.now() - m.wall) / 1000;
+    const elapsed = (Date.now() - m.wall) / 1000; // Date.now(): see heardCtxTime in player.js
     return m.mediaTime + Math.max(0, elapsed) * (m.rate || 1);
   }
 
   updateTakeover() {
     const m = this.lastSync;
     let want = false;
-    if (Date.now() < this.silenceUntil) { this.setTakeover(false); return; }
+    const now = Date.now();
+    if (now < this.silenceUntil) { this.setTakeover(false); return; }
+    if (this.takeover && this.outputStalled(now)) {
+      this.stallSeenAt = 0;
+      const dead = !this.engine.player.rendering;
+      this.handBack(now, dead ? 'the audio output stopped; it is being restarted' : 'the playback thread stopped playing; it has been given the audio again', null);
+      if (dead) this.engine.player.restart('the render thread stopped');
+      else { this.engine.player.rebind(this); this.resync(); }
+      return;
+    }
     if (m && this.settings.enabled && !m.ad && this.engine.active === this && this.engine.player.running) {
       const s = Math.round(this.currentPosition() * SAMPLE_RATE);
       if (this.takeover) want = s >= this.totalSamples || this.buffers.isPlayable(Math.max(0, s), Math.max(0, s) + 1);
@@ -295,11 +359,21 @@ export class Session {
   setTakeover(on) {
     if (this.takeover === on) return;
     this.takeover = on;
+    if (on) this.takeoverSince = Date.now();
+    this.stallSeenAt = 0;
     this.send({ type: 'takeover', on });
     this.pushParams(); // the worklet is audible only while we hold the page's audio
   }
 
   onDeactivated() { this.setTakeover(false); }
+
+  /** The playback thread was rebuilt or given the stores again: whatever was copied to it is gone. */
+  onPlayerRestart() {
+    if (this.pushedMix) this.pushedMix.fill(0);
+    if (this.pushedInst) this.pushedInst.fill(0);
+    this.blindReports = 0; this.clockMisses = 0;
+    this.setTakeover(false);
+  }
 
   /**
    * The playback worklet reports the peak it read from the stores and the peak it actually
@@ -355,7 +429,9 @@ export class Session {
 
   onLevel(info) {
     this.output = info;
+    this.stallSeenAt = 0;
     this.checkBufferVisibility(info);
+    this.checkClock(info);
     const gate = globalThis.VRX.gate;
     if (!gate.outputIsSilent(info, this.takeover)) {
       if (info.outPeak >= gate.SILENT_PEAK) this.silentReason = null;
@@ -370,64 +446,150 @@ export class Session {
       this.handBack(now, `output was silenced after mixing (gain ${info.gain.toFixed(2)}, envelope ${info.envelope.toFixed(2)})`, info);
       return;
     }
-    // What we read from the stores was silent. Three different things look like that, and only
-    // one of them is a reason to let the page's audio through.
-    const peaks = this.storePeaks(this.currentPosition(), 1.5);
-    const kind = gate.storeSilence(peaks);
+    // The playback thread read silence. First: did it read where the video is? A thread reading
+    // somewhere else sits in silence while the stores at the video's position look fine, which
+    // was taken for a quiet instrumental and left alone.
+    const pos = this.currentPosition();
+    const at = Number.isFinite(info.mediaTime) ? info.mediaTime : pos;
+    if (Math.abs(at - pos) > CLOCK_TOLERANCE_S) {
+      this.resync();
+      this.handBack(now, `the playback clock was ${Math.abs(at - pos).toFixed(1)} s off the video; it has been re-synchronised`, info);
+      return;
+    }
+    // Then: what do the stores hold over the stretch that was silent?
+    const stats = this.storeStats(at - 1.5, at + 0.2);
+    const kind = gate.storeSilence(stats);
     if (kind === 'inst-quiet') { this.silentReason = null; return; } // vocals alone here: silence is the karaoke-correct output
     if (kind === 'inst-zero') {
-      // the mixture has audio and the model's output for it is exactly nothing: a failed inference
-      // stored as finished. Marked green, it played as silence, and the hand-back then let the
-      // original -- vocals and all -- through under the green bar. Redo it; original meanwhile.
-      this.reprocess(peaks.blocks, 'the model produced no audio for this part');
+      // an empty instrumental stored as finished (a failed inference, or a cache saved mid-write):
+      // the original plays meanwhile, and every such stretch of the track is processed again
+      this.repairInstrumental('the processed audio was empty', stats.blocks);
       this.handBack(now, 'the processed audio for this part was empty; it is being processed again', info);
       return;
     }
     this.handBack(now, 'the audio decoded for this part is itself silent', info);
   }
 
+  /** The playback thread reports where it reads; persistently off the video, it is put back. */
+  checkClock(info) {
+    const m = this.lastSync;
+    if (!m || !m.playing || m.ad || !info.playing || !Number.isFinite(info.mediaTime)) { this.clockMisses = 0; return; }
+    const off = info.mediaTime - this.currentPosition();
+    if (Math.abs(off) <= CLOCK_TOLERANCE_S) { this.clockMisses = 0; return; }
+    if (++this.clockMisses < 2) return;
+    this.clockMisses = 0;
+    console.warn('[VocalRemover] the playback thread was', off.toFixed(2), 's off the video; re-synchronising');
+    this.resync();
+  }
+
+  resync() {
+    const m = this.lastSync;
+    if (!m || this.engine.active !== this) return;
+    this.engine.player.sync(this, { ...m, mediaTime: this.currentPosition(), wall: Date.now() });
+  }
+
   handBack(now, reason, info) {
     this.silenceUntil = now + 10000;
     this.silentReason = reason;
-    console.warn('[VocalRemover] handing audio back to the page:', reason, info);
+    console.warn('[VocalRemover] handing audio back to the page:', reason, info || '');
     this.setTakeover(false);
     this.broadcastState(true);
   }
 
-  /** Peak levels (0..1) of mixture and instrumental over the processed blocks around `at` seconds. */
-  storePeaks(at, spanSeconds) {
+  /**
+   * Holding the page's audio while the playback thread renders nothing is silence the level
+   * reports cannot reveal: they come from that very thread. Confirmed by two checks half a second
+   * apart, so a main thread that was merely busy (its reports then arrive late, all at once) is
+   * not mistaken for it.
+   */
+  outputStalled(now) {
+    const m = this.lastSync, p = this.engine.player;
+    const quietFor = now - Math.max(this.takeoverSince || 0, this.playingSince || 0, p.lastLevelAt || 0);
+    if (!m || !m.playing || m.ad || p.bound !== this || !p.running || quietFor <= OUTPUT_STALL_MS) { this.stallSeenAt = 0; return false; }
+    if (!this.stallSeenAt) { this.stallSeenAt = now; return false; }
+    return now - this.stallSeenAt >= 500;
+  }
+
+  /** What the stores hold over [fromSec, toSec], counted over the processed (green) blocks only. */
+  storeStats(fromSec, toSec) {
     const b = this.buffers;
-    const b0 = Math.max(0, Math.floor(((at - 0.2) * SAMPLE_RATE) / BLOCK_SIZE));
-    const b1 = Math.min(b.numBlocks - 1, Math.floor(((at + spanSeconds) * SAMPLE_RATE) / BLOCK_SIZE));
-    let mixPeak = 0, instPeak = 0, green = 0;
+    const b0 = Math.max(0, Math.floor((fromSec * SAMPLE_RATE) / BLOCK_SIZE));
+    const b1 = Math.max(b0, Math.min(b.numBlocks - 1, Math.floor((toSec * SAMPLE_RATE) / BLOCK_SIZE)));
+    let mixPeak = 0, instPeak = 0, green = 0, zeroSuspect = 0;
     for (let blk = b0; blk <= b1; blk++) {
       if (!b.instReady[blk]) continue;
       green++;
-      const s = blk * BLOCK_SIZE, e = Math.min(b.totalSamples, s + BLOCK_SIZE);
-      for (let x = s; x < e; x++) {
-        const ml = Math.abs(b.mixL[x]), mr = Math.abs(b.mixR[x]), il = Math.abs(b.instL[x]), ir = Math.abs(b.instR[x]);
-        if (ml > mixPeak) mixPeak = ml;
-        if (mr > mixPeak) mixPeak = mr;
-        if (il > instPeak) instPeak = il;
-        if (ir > instPeak) instPeak = ir;
-      }
+      const mp = b.mixReady[blk] ? blockPeak(b.mixL, b.mixR, blk, b.totalSamples) : 0;
+      const ip = blockPeak(b.instL, b.instR, blk, b.totalSamples);
+      if (mp > mixPeak) mixPeak = mp;
+      if (ip > instPeak) instPeak = ip;
+      // exactly nothing where the mixture is audible, or where there is no mixture to tell
+      if (ip === 0 && (!b.mixReady[blk] || mp >= AUDIBLE_MIX_PEAK)) zeroSuspect++;
     }
-    return { mixPeak: mixPeak / INT16_SCALE, instPeak: instPeak / INT16_SCALE, blocks: [b0, b1], green };
+    return { mixPeak: mixPeak / INT16_SCALE, instPeak: instPeak / INT16_SCALE, green, zeroSuspect, blocks: [b0, b1] };
   }
 
-  /** Blocks whose stored instrumental is wrong go back to unprocessed, and the job is restarted so the worker redoes them. */
-  reprocess([b0, b1], reason) {
+  /**
+   * Green blocks whose instrumental is exactly nothing where it cannot be: under an audible
+   * mixture for half a second or more, or for three seconds with no mixture to compare. That is
+   * what a failed inference stored as finished looks like, and a cache saved mid-write.
+   */
+  findFailedRuns() {
+    const b = this.buffers, nb = b.numBlocks, runs = [];
+    let start = -1, heard = 0;
+    const close = (end) => {
+      if (start >= 0 && (heard >= FAILED_MIN_AUDIBLE_BLOCKS || end - start + 1 >= FAILED_MIN_BLIND_BLOCKS)) runs.push([start, end]);
+      start = -1; heard = 0;
+    };
+    for (let blk = 0; blk < nb; blk++) {
+      let suspect = false, audible = false;
+      if (b.instReady[blk] === 1 && blockIsZero(b.instL, b.instR, blk, b.totalSamples)) {
+        if (!b.mixReady[blk]) suspect = true;
+        else if (blockPeak(b.mixL, b.mixR, blk, b.totalSamples) >= AUDIBLE_MIX_PEAK) { suspect = true; audible = true; }
+      }
+      if (!suspect) { close(blk - 1); continue; }
+      if (start < 0) start = blk;
+      if (audible) heard++;
+    }
+    close(nb - 1);
+    return runs;
+  }
+
+  /** Un-green these block runs: they are processed again (and fetched again where no mixture is held). */
+  clearInstrumental(runs) {
+    const b = this.buffers;
+    let n = 0;
+    for (const [b0, b1] of runs) {
+      for (let blk = b0; blk <= b1; blk++) {
+        if (Atomics.load(b.instReady, blk)) { Atomics.store(b.instReady, blk, 0); n++; }
+        if (this.pushedInst) this.pushedInst[blk] = 0;
+      }
+      if (this.pushMode) this.engine.player.dropBlocks({ kind: 'inst', start: b0, count: b1 - b0 + 1 });
+    }
+    if (n) { this.dirtyInst = true; this.fromCache = false; }
+    return n;
+  }
+
+  /**
+   * Every stretch of empty instrumental in the track is processed again, not only the moment just
+   * heard: a failing backend leaves whole runs of them, and redoing a second and a half at a time
+   * left the rest playing silence, then the original, for minutes.
+   */
+  repairInstrumental(reason, window) {
     const now = Date.now();
-    if (now - (this.lastReprocessAt || 0) < 5000) return;
+    if (now - (this.lastReprocessAt || 0) < 5000) return 0;
     this.lastReprocessAt = now;
+    let runs = this.findFailedRuns();
+    if (!runs.length && window) runs = [window]; // too short to show up as a run: at least what was just heard
+    const n = this.clearInstrumental(runs);
+    if (!n) return 0;
     this.reprocessCount = (this.reprocessCount || 0) + 1;
-    console.warn('[VocalRemover] reprocessing blocks', b0, '-', b1, ':', reason);
-    this.buffers.instReady.fill(0, b0, b1 + 1);
-    if (this.pushedInst) this.pushedInst.fill(0, b0, b1 + 1);
-    this.dirtyInst = true; this.fromCache = false;
+    console.warn('[VocalRemover] processing', n, 'blocks again:', reason);
     // twice is a pattern: the backend is not to be trusted on this machine
     if (this.reprocessCount >= 2) this.engine.separator.suspectBackend(reason);
     this.engine.separator.reprocess(this);
+    this.broadcastState(true);
+    return n;
   }
 
   // ------------------------------------------------------------------ processing
@@ -469,9 +631,13 @@ export class Session {
       this.buffers.instReady.fill(0);
       this.buffers.instL.fill(0); this.buffers.instR.fill(0);
       if (this.pushedInst) this.pushedInst.fill(0);
+      if (this.pushMode) this.engine.player.dropBlocks({ kind: 'inst', start: 0, count: this.buffers.numBlocks }); // the old model's copies too
       this.dirtyInst = false; this.jobState = 'idle'; this.processedChunks = 0; this.speed = null; this.error = null;
       await this.loadInstFromCache();
     } finally { this.switching = false; }
+    // the settings moved on again while this switch ran: follow them
+    const out = this.outputFor;
+    if (out && (out.modelId !== this.settings.modelId || out.quality !== this.settings.quality)) return this.switchOutput(out);
     this.ensureProcessing();
     this.broadcastState(true);
   }
@@ -496,16 +662,30 @@ export class Session {
   }
 
   async loadInstFromCache() {
+    const want = { modelId: this.settings.modelId, quality: this.settings.quality };
+    const key = this.instKey;
     try {
-      const inst = await this.engine.cache.load(this.instKey);
+      const inst = await this.engine.cache.load(key);
       if (inst && inst.totalSamples === this.totalSamples) {
-        this.buffers.instL.set(new Int16Array(inst.instL)); this.buffers.instR.set(new Int16Array(inst.instR));
-        this.buffers.instReady.set(new Uint8Array(inst.instReady));
+        // Merged block by block into what is not ready yet: a load that arrives late (the attach
+        // went ahead without waiting for it) must not overwrite what a job has produced meanwhile.
+        const b = this.buffers, L = new Int16Array(inst.instL), Rr = new Int16Array(inst.instR), ready = new Uint8Array(inst.instReady);
+        for (let blk = 0; blk < b.numBlocks; blk++) {
+          if (!ready[blk] || Atomics.load(b.instReady, blk)) continue;
+          const s0 = blk * BLOCK_SIZE, e0 = Math.min(b.totalSamples, s0 + BLOCK_SIZE);
+          b.instL.set(L.subarray(s0, e0), s0); b.instR.set(Rr.subarray(s0, e0), s0);
+          Atomics.store(b.instReady, blk, 1);
+        }
+        // an entry saved by an earlier version (or by a backend that failed without a word) can
+        // hold empty stretches marked finished: those are processed again rather than trusted
+        const cleared = this.clearInstrumental(this.findFailedRuns());
+        if (cleared) console.warn('[VocalRemover] the cached instrumental had', cleared, 'blocks of empty output; they are processed again');
         this.fromCache = this.complete;
         this.engine.cache.touch(this.instKey);
         if (this.engine.active === this) this.engine.player.bind(this);
       } else this.fromCache = false;
     } catch (e) { console.warn('[VocalRemover] inst cache load failed', e); }
+    this.outputFor = want;
   }
 
   /** One persist at a time; a request made meanwhile runs once the current one is done. */
@@ -519,23 +699,35 @@ export class Session {
   }
 
   async _persistNow() {
-    if (this.dirtyMix && this.buffers.countReady(this.buffers.mixReady) > 0) {
+    const b = this.buffers;
+    if (this.dirtyMix && b.countReady(b.mixReady) > 0) {
       this.dirtyMix = false;
-      const snap = { mixL: this.buffers.mixL, mixR: this.buffers.mixR, mixReady: this.buffers.mixReady };
-      const copy = (a) => { const o = new a.constructor(a.length); o.set(a); return o.buffer; };
-      const ok = await this.engine.cache.save({ key: this.mixKey, videoId: this.videoId, kind: 'mix', title: this.title, duration: this.duration, totalSamples: this.totalSamples, sampleRate: SAMPLE_RATE, mixL: copy(snap.mixL), mixR: copy(snap.mixR), mixReady: copy(snap.mixReady), bytes: this.totalSamples * 4 + this.buffers.numBlocks });
+      const mixReady = snapshotBitmap(b.mixReady); // before the samples, as in persistInst
+      const mixL = blobOf(b.mixL), mixR = blobOf(b.mixR);
+      const ok = await this.engine.cache.save({ key: this.mixKey, videoId: this.videoId, kind: 'mix', title: this.title, duration: this.duration, totalSamples: this.totalSamples, sampleRate: SAMPLE_RATE, mixL, mixR, mixReady: blobOf(mixReady), bytes: this.totalSamples * 4 + b.numBlocks });
       if (!ok) this.dirtyMix = true; // try again next time rather than forgetting the change
     }
-    if (this.dirtyInst && this.buffers.countReady(this.buffers.instReady) > 0) {
+    // never mid-switch (switchOutput files the old output itself), and under the key of what the
+    // stores hold: saved under the new settings' key, the old model's output would pass for the new one's
+    if (this.dirtyInst && !this.switching && b.countReady(b.instReady) > 0) {
       this.dirtyInst = false;
-      const ok = await this.persistInst(this.instKey);
+      const ok = await this.persistInst(this.outputKey);
       if (!ok) this.dirtyInst = true;
     }
   }
 
   async persistInst(key) {
-    const copy = (a) => { const o = new a.constructor(a.length); o.set(a); return o.buffer; };
-    return this.engine.cache.save({ key, videoId: this.videoId, kind: 'inst', title: this.title, duration: this.duration, totalSamples: this.totalSamples, sampleRate: SAMPLE_RATE, instL: copy(this.buffers.instL), instR: copy(this.buffers.instR), instReady: copy(this.buffers.instReady), complete: this.complete, bytes: this.totalSamples * 4 + this.buffers.numBlocks });
+    const b = this.buffers;
+    // The ready bitmap is read before the samples. The separator writes a block's samples and only
+    // then marks it ready, so every block ready in this snapshot has its samples in the copy that
+    // follows. Copied the other way round, a block finished during the copy was saved as ready
+    // with the samples from before it was written: a green stretch of silence the next time the
+    // cache loaded, and the original the moment the engine noticed.
+    const instReady = snapshotBitmap(b.instReady);
+    const instL = blobOf(b.instL), instR = blobOf(b.instR);
+    let ready = 0;
+    for (let i = 0; i < instReady.length; i++) ready += instReady[i];
+    return this.engine.cache.save({ key, videoId: this.videoId, kind: 'inst', title: this.title, duration: this.duration, totalSamples: this.totalSamples, sampleRate: SAMPLE_RATE, instL, instR, instReady: blobOf(instReady), complete: ready === b.numBlocks, bytes: this.totalSamples * 4 + b.numBlocks });
   }
 
   // ------------------------------------------------------------------ status
@@ -548,7 +740,10 @@ export class Session {
     const processedPct = pct(processed);
     const active = this.engine.active === this;
     let phase, message, detail = null;
-    if (this.error) { phase = 'error'; message = 'Processing failed.'; detail = this.error; }
+    if (this.error) {
+      phase = 'error'; message = 'Processing failed.'; detail = this.error;
+      if (/memory|allocat|\boom\b/i.test(this.error)) detail = `This device ran out of memory for the separation model (${this.error}). Close other tabs or apps, then press Retry.`;
+    }
     else if (!this.settings.enabled) { phase = 'off'; message = 'Off'; }
     else if (this.complete) {
       phase = 'ready';
@@ -574,12 +769,19 @@ export class Session {
       else if (this.embed.active && !this.embed.progress && !this.decoder.isComplete()) detail = `Starting the background fetch (${describeHelper(this.embed.kind)})…`;
       else if (this.decoder.exhaustedFailedSeconds() > 0 && this.jobState === 'waiting') detail = `${Math.round(this.decoder.exhaustedFailedSeconds())} s could not be decoded by the browser even after retries; YouTube's own audio plays there and processing stops short of it.`;
       else if (this.decoder.failedRanges.length) detail = `${Math.round(R.total(this.decoder.failedRangesSeconds()))} s could not be decoded by the browser and stay unprocessed; they are retried a few times.`;
-      else if (this.lastSync && this.lastSync.playing && this.engine.active === this && !this.engine.player.running) detail = `Audio output is ${this.engine.player.ctx ? this.engine.player.ctx.state : 'not started'}; trying to resume it, the original audio plays meanwhile.`;
       else if (this.decoder.error) detail = 'Decoding hit an error and is being retried: ' + String(this.decoder.error && this.decoder.error.message || this.decoder.error);
       else if (this.jobState === 'waiting') detail = 'Waiting for more audio to be fetched…';
       else if (this.jobState === 'running' && Date.now() - this.lastJobEventAt > 20000) detail = `The separation model has not reported progress for ${Math.round((Date.now() - this.lastJobEventAt) / 1000)} s; it is restarted if this continues.`;
       else if (!active) detail = 'Another tab is using the audio engine; processing is queued.';
       else if (!this.takeover && this.lastSync && R.total(processed) > 0) detail = 'Playing the original audio until the processed part is reached.';
+    }
+    // Also once the whole track is done: the original playing under a green bar needs saying most of all.
+    if (!this.error && this.settings.enabled && !detail) {
+      const p = this.engine.player;
+      if (this.lastSync && this.lastSync.playing && this.engine.active === this && !p.running) {
+        const why = p.error || this.outputError || (p.ctx ? 'it is ' + p.ctx.state : 'it has not started');
+        detail = `Audio output is not working (${why}); trying to restart it. The original audio plays meanwhile.`;
+      } else if (this.silentReason && Date.now() < this.silenceUntil) detail = `Playing the original audio: ${this.silentReason}.`;
     }
     return { phase, message, detail, backend: this.backend, speed: this.speed, duration: this.duration, captured, decoded, processed, fromCache: this.fromCache, capturedPct, processedPct };
   }

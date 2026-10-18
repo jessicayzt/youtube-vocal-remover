@@ -76,6 +76,14 @@ test('silence from the stores is told apart by what the stores hold', () => {
   assert.equal(storeSilence(null), 'mix-silent');
 });
 
+test('with per-block counts, an empty instrumental is found even next to a few good blocks', () => {
+  assert.equal(storeSilence({ mixPeak: 0.5, instPeak: 0.2, green: 60, zeroSuspect: 50 }), 'inst-zero', 'mostly empty: a failure');
+  assert.equal(storeSilence({ mixPeak: 0.5, instPeak: 0.0001, green: 60, zeroSuspect: 0 }), 'inst-quiet');
+  assert.equal(storeSilence({ mixPeak: 0, instPeak: 0, green: 60, zeroSuspect: 60 }), 'inst-zero', 'empty with no mixture to compare: distrusted');
+  assert.equal(storeSilence({ mixPeak: 0, instPeak: 0, green: 60, zeroSuspect: 0 }), 'mix-silent');
+  assert.equal(storeSilence({ mixPeak: 0, instPeak: 0, green: 0, zeroSuspect: 0 }), 'mix-silent', 'nothing green: not the instrumental');
+});
+
 test('the two peaks say which side went quiet', () => {
   assert.equal(cause({ srcPeak: 0.5, outPeak: 0 }), 'after-mix', 'read audio but emitted none');
   assert.equal(cause({ srcPeak: 0, outPeak: 0 }), 'source', 'the decoded audio is itself silent');

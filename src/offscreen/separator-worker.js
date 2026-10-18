@@ -4,6 +4,7 @@
 import * as ort from '../../vendor/ort/ort.min.mjs';
 import { STFT } from '../dsp/stft.js';
 import { MdxGrid, MdxAccumulator } from '../dsp/mdx.js';
+import { OutputChecker, isAudible, energy } from '../dsp/output-check.js';
 
 ort.env.wasm.wasmPaths = new URL('../../vendor/ort/', import.meta.url).href;
 // leave cores for the page: saturating the CPU makes YouTube's player stall and complain
@@ -59,22 +60,18 @@ async function getSession(modelId) {
     }
   }
   if (!session) session = await ort.InferenceSession.create(url, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
-  const entry = { session, backend, spec, inputName: session.inputNames[0], outputName: session.outputNames[0] };
+  // one checker per model session: a recycled buffer can come from any earlier run of it
+  const entry = { session, backend, spec, inputName: session.inputNames[0], outputName: session.outputNames[0], checker: new OutputChecker(backend) };
   sessions.set(modelId, entry);
   return entry;
 }
 
-// A GPU short of memory can fail without a word: the run resolves and the output is nothing, or
-// NaN. Before a backend's first chunk it is tried on a signal that must come back with audio in
-// it, and every chunk's output has to be finite. Either failing is an error, which the engine
-// answers by retrying, then by switching to WebAssembly.
-function assertFinite(a, what) {
-  for (let i = 0; i < a.length; i++) { const v = a[i]; if (v !== v || v === Infinity || v === -Infinity) throw new Error(`the model produced non-finite ${what}`); }
-}
-function energy(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * a[i]; return s; }
-
+// A GPU short of memory can fail without a word (see ../dsp/output-check.js). Before a backend's
+// first chunk it is tried on a test signal, and every chunk's results are checked before any of
+// it is stored. A failure is an error, which the engine answers by retrying, then by switching
+// to WebAssembly; nothing of a failed chunk ever turns green.
 async function probeBackend(entry, grid, stft) {
-  const { session, spec, inputName, outputName, backend } = entry;
+  const { session, spec, inputName, outputName, backend, checker } = entry;
   const T = spec.dimT, dimF = spec.dimF;
   const cl = new Float32Array(grid.chunkSize), cr = new Float32Array(grid.chunkSize);
   for (let i = 0; i < cl.length; i++) {
@@ -84,14 +81,14 @@ async function probeBackend(entry, grid, stft) {
   }
   const specBuf = new Float32Array(4 * dimF * T);
   stft.forward([cl, cr], specBuf, 3);
+  const inFp = checker.input(specBuf);
   const r = await session.run({ [inputName]: new ort.Tensor('float32', specBuf, [1, 4, dimF, T]) });
   const out = r[outputName].data;
-  assertFinite(out, 'output in its self-check');
+  checker.output(inFp, out, true);
   const oL = new Float32Array(grid.chunkSize), oR = new Float32Array(grid.chunkSize);
   stft.inverse(out, T, [oL, oR]);
-  const eIn = energy(cl) + energy(cr), eOut = energy(oL) + energy(oR);
-  if (!(eOut > eIn * 1e-6)) throw new Error(`backend self-check failed: the model returned no audio for a test signal (${backend})`);
-  post({ type: 'log', message: `backend self-check passed on ${backend} (output/input energy ${(eOut / eIn).toFixed(3)})` });
+  checker.audio(cl, cr, oL, oR);
+  post({ type: 'log', message: `backend self-check passed on ${backend} (output/input energy ${(energy(oL) + energy(oR)) / (energy(cl) + energy(cr))})` });
 }
 
 function startJob(m) {
@@ -114,7 +111,7 @@ function startJob(m) {
 async function runJob(j, m) {
   post({ type: 'loading', jobId: j.id });
   const entry = await getSession(m.modelId);
-  const { spec, session, backend, inputName, outputName } = entry;
+  const { spec, session, backend, inputName, outputName, checker } = entry;
   if (j.cancelled) { post({ type: 'cancelled', jobId: j.id }); return; }
 
   const grid = new MdxGrid({ nFft: spec.nFft, hop: spec.hop, dimT: spec.dimT, overlap: m.overlap, totalSamples: m.totalSamples, blockSize: m.blockSize });
@@ -137,22 +134,22 @@ async function runJob(j, m) {
         instL[x] = a > 32767 ? 32767 : a < -32768 ? -32768 : Math.round(a);
         instR[x] = c > 32767 ? 32767 : c < -32768 ? -32768 : Math.round(c);
       }
-      instReady[b] = 1;
+      Atomics.store(instReady, b, 1);
     },
   });
   // chunks whose blocks are all already final (cache or an earlier run) need no work
   for (let k = 0; k < grid.numChunks; k++) {
     const rng = grid.blocksOfChunk(k);
     let all = true;
-    if (rng) for (let b = rng[0]; b <= rng[1]; b++) if (!instReady[b]) { all = false; break; }
+    if (rng) for (let b = rng[0]; b <= rng[1]; b++) if (!Atomics.load(instReady, b)) { all = false; break; }
     if (all) { acc.processed[k] = 1; acc.processedCount++; }
   }
-  for (let b = 0; b < grid.numBlocks; b++) if (instReady[b]) { acc.finalBlocks[b] = 1; acc.finalCount++; }
+  for (let b = 0; b < grid.numBlocks; b++) if (Atomics.load(instReady, b)) { acc.finalBlocks[b] = 1; acc.finalCount++; }
 
   const mixReadyForChunk = (k) => {
     const rng = grid.blocksOfChunk(k);
     if (!rng) return true;
-    for (let b = rng[0]; b <= rng[1]; b++) if (!mixReady[b]) return false;
+    for (let b = rng[0]; b <= rng[1]; b++) if (!Atomics.load(mixReady, b)) return false;
     return true;
   };
   const tryFrom = (from) => {
@@ -207,19 +204,24 @@ async function runJob(j, m) {
       if (x < 0 || x >= total) { cl[i] = 0; cr[i] = 0; } else { cl[i] = mixL[x] * inv; cr[i] = mixR[x] * inv; }
     }
     stft.forward([cl, cr], specBuf, 3);
+    const audible = isAudible(cl, cr);
+    const in1 = checker.input(specBuf);
     const r1 = await session.run({ [inputName]: new ort.Tensor('float32', specBuf, dims) });
     let outData = r1[outputName].data;
+    checker.output(in1, outData, audible);
     if (specNeg) {
       for (let i = 0; i < specBuf.length; i++) specNeg[i] = -specBuf[i];
+      const in2 = checker.input(specNeg);
       const r2 = await session.run({ [inputName]: new ort.Tensor('float32', specNeg, dims) });
       const d2 = r2[outputName].data;
+      checker.output(in2, d2, audible); // the first pass's result read back here would cancel it to silence
       const merged = new Float32Array(outData.length);
       for (let i = 0; i < merged.length; i++) merged[i] = 0.5 * outData[i] - 0.5 * d2[i];
       outData = merged;
     }
     const oL = new Float32Array(grid.chunkSize), oR = new Float32Array(grid.chunkSize);
     stft.inverse(outData, T, [oL, oR]);
-    assertFinite(oL, 'output'); assertFinite(oR, 'output');
+    checker.audio(cl, cr, oL, oR);
     acc.addChunkOutput(k, oL, oR);
     const dt = (performance.now() - t0) / 1000;
     const inst = (grid.step / 44100) / Math.max(dt, 1e-3);

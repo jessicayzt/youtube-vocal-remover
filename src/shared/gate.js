@@ -57,7 +57,14 @@
    *               silence is the right output and the page's audio would be the wrong one
    */
   function storeSilence(peaks) {
-    if (!peaks || !(peaks.mixPeak >= SILENT_PEAK)) return 'mix-silent';
+    if (!peaks) return 'mix-silent';
+    // with per-block counts (green blocks, and those whose instrumental is exactly nothing where it
+    // cannot be): an empty instrumental is told apart even when a few blocks around it are fine
+    if (Number.isFinite(peaks.green) && Number.isFinite(peaks.zeroSuspect)) {
+      if (peaks.green > 0 && peaks.zeroSuspect * 2 >= peaks.green) return 'inst-zero';
+      return peaks.mixPeak >= SILENT_PEAK ? 'inst-quiet' : 'mix-silent';
+    }
+    if (!(peaks.mixPeak >= SILENT_PEAK)) return 'mix-silent';
     if (peaks.instPeak === 0) return 'inst-zero';
     return 'inst-quiet';
   }

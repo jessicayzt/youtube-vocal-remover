@@ -46,7 +46,7 @@ export class TrackBuffers {
     const b0 = Math.ceil(startSample / BLOCK_SIZE);
     let b1 = Math.floor(endSample / BLOCK_SIZE); // exclusive block index
     if (endSample >= this.totalSamples) b1 = this.numBlocks;
-    for (let b = b0; b < b1; b++) this.mixReady[b] = 1;
+    for (let b = b0; b < b1; b++) Atomics.store(this.mixReady, b, 1);
   }
 
   /**
@@ -60,7 +60,7 @@ export class TrackBuffers {
       const s = b * BLOCK_SIZE, e = Math.min(this.totalSamples, s + BLOCK_SIZE);
       let covered = 0;
       for (const r of ranges) { if (r[0] <= s && r[1] >= e) { covered = 1; break; } if (r[0] > s) break; }
-      this.mixReady[b] = covered;
+      Atomics.store(this.mixReady, b, covered); // after the samples: a reader that sees the flag sees them
     }
   }
 

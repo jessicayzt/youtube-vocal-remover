@@ -62,6 +62,12 @@ class VrxPlayerProcessor extends AudioWorkletProcessor {
         else { loc.mixL.set(L, at); loc.mixR.set(R, at); loc.mixReady.fill(1, m.start, m.start + m.count); }
         break;
       }
+      case 'drop': {
+        // blocks the engine no longer trusts (an empty instrumental being redone, a model switch):
+        // the copies pushed here must stop playing too
+        if (this.local) (m.kind === 'inst' ? this.local.instReady : this.local.mixReady).fill(0, m.start, m.start + m.count);
+        break;
+      }
       case 'buffers': {
         this.local = null;
         // a new track starts stopped; its own sync follows. The previous track's clock must not

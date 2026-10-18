@@ -3,176 +3,12 @@
 import { Session, CACHE_VERSION } from './session.js';
 import { Player } from './player.js';
 import { TrackCache } from './cache.js';
+import { SeparatorClient } from './separator-client.js';
 
 const MAX_SESSIONS_IN_MEMORY = 3;
 // An AudioContext that is merely slow to start must not hold a session's messages hostage: after
 // this long the session goes ahead without playback and binds the player once it is ready.
 const PLAYER_START_TIMEOUT_MS = 15000;
-// A separation job that reports nothing for this long is wedged (a hung GPU submission, a
-// crashed worker whose error never surfaced): the worker is replaced and the job restarted.
-// The first chunk of a job also compiles the model's GPU pipelines, which can take minutes on a
-// slow machine, so a job that has not produced a chunk yet is given much longer.
-const JOB_STALL_MS = { loading: 180000, firstChunk: 300000, running: 120000 };
-
-class SeparatorClient {
-  constructor(engine) {
-    this.engine = engine;
-    this.current = null; this.queue = []; this.counter = 0; this.starting = false;
-    this.lastEventAt = 0;
-    this.waiters = new Map(); // session -> resolvers waiting for its running job to end
-    this.forceWasm = false;   // set once WebGPU has failed or stalled twice: the model then runs on WebAssembly
-    this.loadingStalls = 0;
-    this.spawn();
-    setInterval(() => this.watchdog(), 5000);
-  }
-
-  spawn() {
-    const worker = new Worker(chrome.runtime.getURL('src/offscreen/separator-worker.js'), { type: 'module' });
-    worker.onmessage = (e) => { if (this.worker === worker) this.onMessage(e.data); };
-    worker.onerror = (e) => { if (this.worker === worker) this.restartWorker('worker error: ' + (e && e.message || e)); };
-    worker.postMessage({ type: 'init', registry: this.engine.registry, forceWasm: this.forceWasm });
-    this.worker = worker;
-  }
-
-  /** Replace the worker and put the interrupted job back at the front of the queue. */
-  restartWorker(reason) {
-    console.warn('[VocalRemover] restarting the separation worker:', reason);
-    try { this.worker.terminate(); } catch (e) { /* ignore */ }
-    const interrupted = this.current;
-    this.current = null;
-    this.spawn();
-    if (interrupted) {
-      interrupted.onWorkerEvent({ type: 'cancelled', jobId: interrupted.jobId });
-      this._settle(interrupted);
-      if (interrupted.needsProcessing && !this.queue.includes(interrupted)) this.queue.unshift(interrupted);
-    }
-    this.schedule();
-  }
-
-  watchdog() {
-    const s = this.current;
-    if (!s) return;
-    let limit;
-    if (s.jobState === 'loading') limit = JOB_STALL_MS.loading;
-    else if (s.jobState === 'running') limit = this.advanced ? JOB_STALL_MS.running : JOB_STALL_MS.firstChunk;
-    else return; // waiting for audio, or between states
-    const idle = Date.now() - this.lastEventAt;
-    if (idle > limit) {
-      // a model that cannot even load twice in a row is not going to on this backend
-      if (s.jobState === 'loading' && ++this.loadingStalls >= 2 && !this.forceWasm) { this.forceWasm = true; console.warn('[VocalRemover] the model would not load on WebGPU; switching to WebAssembly'); }
-      this.restartWorker(`no progress for ${Math.round(idle / 1000)} s while ${s.jobState}`);
-    }
-  }
-
-  request(session) {
-    if (this.current === session || this.queue.includes(session)) return;
-    if (this.engine.active === session) {
-      // what is playing goes first, even if another video's job is under way (its 'cancelled' re-queues it)
-      this.queue.unshift(session);
-      if (this.current) { this.worker.postMessage({ type: 'cancel', jobId: this.current.jobId }); return; }
-    } else this.queue.push(session);
-    this.schedule();
-  }
-
-  setActive(session) {
-    if (!session || !session.needsProcessing) { this.schedule(); return; }
-    if (this.current === session) return;
-    const i = this.queue.indexOf(session);
-    if (i >= 0) this.queue.splice(i, 1);
-    this.queue.unshift(session);
-    if (this.current) this.worker.postMessage({ type: 'cancel', jobId: this.current.jobId }); // its 'cancelled' event re-queues it
-    else this.schedule();
-  }
-
-  cancel(session) {
-    const i = this.queue.indexOf(session);
-    if (i >= 0) this.queue.splice(i, 1);
-    if (this.current === session) this.worker.postMessage({ type: 'cancel', jobId: session.jobId });
-  }
-
-  /** Like cancel(), resolving once the session's job has actually ended, its chunk in flight included. */
-  cancelAndWait(session) {
-    this.cancel(session);
-    if (this.current !== session) return Promise.resolve();
-    return new Promise((resolve) => {
-      if (!this.waiters.has(session)) this.waiters.set(session, []);
-      this.waiters.get(session).push(resolve);
-    });
-  }
-
-  /** The session has unmarked blocks it wants redone: end its running job; the next one re-reads the bitmap. */
-  reprocess(session) {
-    this.cancelAndWait(session).then(() => { if (session.needsProcessing) this.request(session); });
-  }
-
-  /** Empty output more than once is a backend failing without a word: WebAssembly from here on. */
-  suspectBackend(reason) {
-    if (this.forceWasm) return;
-    this.forceWasm = true;
-    console.warn('[VocalRemover] the separation backend produced empty output repeatedly; switching to WebAssembly:', reason);
-    this.restartWorker('backend suspected: ' + reason);
-  }
-
-  _settle(session) {
-    const w = this.waiters.get(session);
-    if (!w) return;
-    this.waiters.delete(session);
-    for (const resolve of w) resolve();
-  }
-
-  priority(session, block, playing) { if (this.current === session) this.worker.postMessage({ type: 'priority', jobId: session.jobId, block, playing: !!playing }); }
-  mixProgress(session) { if (this.current === session) this.worker.postMessage({ type: 'mix-progress', jobId: session.jobId }); }
-
-  schedule() {
-    if (this.current) return;
-    let next = null;
-    while (this.queue.length && !next) { const s = this.queue.shift(); if (s.needsProcessing) next = s; }
-    if (!next) return;
-    this.current = next;
-    next.jobId = ++this.counter;
-    next.jobState = 'loading';
-    this.lastEventAt = Date.now();
-    this.startChunks = null; this.advanced = false;
-    this.worker.postMessage({ type: 'start', jobId: next.jobId, ...next.jobParams() });
-  }
-
-  onMessage(m) {
-    if (m.type === 'log') { console.info('[VocalRemover worker]', m.message); return; }
-    const session = this.current && this.current.jobId === m.jobId ? this.current : null;
-    if (!session) return;
-    this.lastEventAt = Date.now();
-    if (m.type === 'progress') {
-      if (this.startChunks == null) this.startChunks = m.processedChunks;
-      else if (m.processedChunks > this.startChunks) { this.advanced = true; this.loadingStalls = 0; }
-    }
-    if (m.type === 'error') {
-      // A failed job (a lost GPU device, an out-of-memory) used to be final until the person
-      // pressed Retry. It is retried once on a fresh worker, then once more on WebAssembly, and
-      // only then shown as an error.
-      session.jobErrors = (session.jobErrors || 0) + 1;
-      if (session.jobErrors <= 2) {
-        if (session.jobErrors === 2) this.forceWasm = true;
-        console.warn('[VocalRemover] separation failed:', m.message, this.forceWasm ? '- retrying on WebAssembly' : '- retrying');
-        session.jobState = 'idle';
-        this.current = null;
-        this._settle(session);
-        if (session.needsProcessing && !this.queue.includes(session)) this.queue.unshift(session);
-        session.broadcastState(true);
-        this.restartWorker('job error: ' + m.message);
-        return;
-      }
-    }
-    if (m.type === 'done') session.jobErrors = 0;
-    session.onWorkerEvent(m);
-    if (m.type === 'done' || m.type === 'cancelled' || m.type === 'error') {
-      this.current = null;
-      this._settle(session);
-      if (m.type === 'cancelled' && session.needsProcessing && !this.queue.includes(session)) this.queue.push(session);
-      this.schedule();
-    }
-  }
-}
-
 class Engine {
   constructor(registry) {
     this.registry = registry;
@@ -183,6 +19,7 @@ class Engine {
     this.active = null;
     this.player.onReady = () => { if (this.active) this.player.bind(this.active); };
     this.player.onLevel = (info, session) => { if (session && session.onLevel) session.onLevel(info); };
+    this.player.onReset = () => { for (const s of this.sessions.values()) s.onPlayerRestart(); };
   }
 
   session(videoId, hello) {
@@ -281,7 +118,12 @@ chrome.runtime.onConnect.addListener((port) => {
     if (m.type === 'hello') {
       if (port.name === 'vrx-controller') {
         if (!Number.isFinite(m.duration) || m.duration <= 0) { reply({ type: 'error', message: 'Unknown video duration.' }); return; }
-        session = engine.session(m.videoId, m);
+        try { session = engine.session(m.videoId, m); } catch (e) {
+          // the track's stores did not fit in memory: say so, rather than leave the page starting for good
+          const mb = Math.round((Math.round(m.duration * 44100) * 8) / 1e6);
+          reply({ type: 'error', message: `Not enough memory to hold this video's audio (about ${mb} MB).`, detail: 'Close other tabs or apps, or try a shorter video. (' + String(e && e.message || e) + ')' });
+          return;
+        }
         attaching = (async () => {
           const playerError = await engine.startPlayer();
           await session.attachController(port, m, playerError);
