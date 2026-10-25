@@ -404,20 +404,52 @@
     const SEEK_MIN_GAIN_SECONDS = 2;  // a seek that would gain less than this is not worth it
     const BUFFER_STILL_MS = 800;      // the buffered end has not moved for this long: the player is done fetching
     let finished = false, fetchedTo = 0, lastEnd = -1, endStillSince = 0, lastSeekAt = 0, lastSkipAt = 0;
-    // YouTube keeps the quality a player was set to in the origin's localStorage (yt-player-quality)
-    // and applies it to the next video loaded from that origin. On www.youtube.com this helper
-    // shares that storage with the page the person is watching, so asking for the lowest video
-    // quality here made every later video of theirs start at 144p. Whatever the preference was
-    // before the request is put back the moment it changes.
-    const QUALITY_KEYS = ['yt-player-quality'];
-    let qualityBefore = null; // key -> value (null when absent), taken before the player was touched
-    const readQuality = () => { const m = new Map(); for (const k of QUALITY_KEYS) { try { m.set(k, localStorage.getItem(k)); } catch (e) { m.set(k, null); } } return m; };
-    const restoreQuality = () => {
-      if (!qualityBefore) return;
-      for (const [k, v] of qualityBefore) {
-        try { if (localStorage.getItem(k) !== v) { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } } catch (e) { /* storage unavailable */ }
+    // YouTube keeps a player's quality and volume in the origin's localStorage and applies them to
+    // the next video from that origin. A helper on www.youtube.com shares that storage with the
+    // page the person is watching, so the lowest quality it asks for made every later video of
+    // theirs start at 144p. A stored value is put back only when it is what the helper causes (the
+    // lowest quality, a muted or zero volume) and was not before: a change the person makes in the
+    // page meanwhile is theirs to keep. (Undoing every change, as before, reverted their own.)
+    const HELPER_PREFS = [
+      { key: 'yt-player-quality', helpers: (v) => typeof v === 'string' && /quality\\?":\s*\\?"?(144|tiny)\b/.test(v) },
+      { key: 'yt-player-volume', helpers: (v) => typeof v === 'string' && (/muted\\?":\s*true/.test(v) || /volume\\?":\s*0(?![.\d])/.test(v)) },
+    ];
+    const readPrefs = () => new Map(HELPER_PREFS.map(({ key }) => { try { return [key, localStorage.getItem(key)]; } catch (e) { return [key, null]; } }));
+    const prefsBefore = readPrefs(); // at document start, before the helper's player has touched anything
+    const restorePrefs = () => {
+      for (const { key, helpers } of HELPER_PREFS) {
+        const was = prefsBefore.get(key);
+        let now;
+        try { now = localStorage.getItem(key); } catch (e) { continue; }
+        if (now === was || !helpers(now) || helpers(was)) continue;
+        try { if (was === null) localStorage.removeItem(key); else localStorage.setItem(key, was); } catch (e) { /* storage unavailable */ }
       }
     };
+    // The helper must never be heard. Muting it from the drive timer left gaps in which YouTube's
+    // player put its own volume back -- around the seeks the helper makes every few seconds, for
+    // one -- and with the watched video paused, those gaps were heard as snippets of the song.
+    // Every media element in a helper frame is now held muted at the element: its volume and muted
+    // properties are shadowed (YouTube's player writes and reads its own values; the element stays
+    // silent), and an element that loads, plays or changes volume is silenced on the spot. The
+    // player's own mute() is not used: it writes the muted state into storage the page may share.
+    const silenced = new WeakSet();
+    const silence = (el) => {
+      if (!(el instanceof HTMLMediaElement)) return;
+      if (!silenced.has(el)) {
+        silenced.add(el);
+        const seen = { volume: volDesc.get.call(el), muted: mutedDesc.get.call(el) };
+        try {
+          Object.defineProperty(el, 'volume', { configurable: true, get() { return seen.volume; }, set(v) { seen.volume = Math.min(1, Math.max(0, Number(v) || 0)); } });
+          Object.defineProperty(el, 'muted', { configurable: true, get() { return seen.muted; }, set(v) { seen.muted = !!v; } });
+        } catch (e) { /* ignore */ }
+      }
+      try {
+        if (!mutedDesc.get.call(el)) mutedDesc.set.call(el, true);
+        if (volDesc.get.call(el) !== 0) volDesc.set.call(el, 0);
+      } catch (e) { /* ignore */ }
+    };
+    for (const type of ['loadstart', 'play', 'playing', 'volumechange', 'seeking']) document.addEventListener(type, (e) => silence(e.target), true);
+    const silenceAll = () => { for (const el of document.querySelectorAll('video, audio')) silence(el); };
     const bufferedEndAt = (video, t) => {
       try {
         for (let i = 0; i < video.buffered.length; i++) if (video.buffered.start(i) <= t + 0.5 && video.buffered.end(i) >= t) return video.buffered.end(i);
@@ -448,21 +480,20 @@
         // it is the video streams that would otherwise compete with the real player for bandwidth
         try {
           if (!qualitySet && typeof player.setPlaybackQualityRange === 'function') {
-            qualityBefore = readQuality();
             player.setPlaybackQualityRange('tiny', 'tiny');
             qualitySet = true;
           }
         } catch (e) { /* ignore */ }
-        restoreQuality();
-        try { if (typeof player.mute === 'function' && !player.isMuted?.()) player.mute(); } catch (e) { /* ignore */ }
       }
+      restorePrefs();
       const err = errorText();
       if (err && err !== lastErrorText) {
         lastErrorText = err;
         post({ t: 'embed', event: 'error', message: err });
       }
+      silenceAll(); // and again on every tick, for an element that slipped past the events
+      if (video) silence(video);
       if (video) {
-        try { mutedDesc.set.call(video, true); volDesc.set.call(video, 0); } catch (e) { /* ignore */ }
         if (video.paused && !video.ended && video.readyState >= 1) video.play().catch(() => {});
         if (video.paused && !video.ended && Date.now() - started > 2000 && kicks < 20) {
           // no autoplay: poke the player like a click would

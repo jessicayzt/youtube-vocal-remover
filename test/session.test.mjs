@@ -96,7 +96,8 @@ async function sessionAt(engine, fillInst) {
   const SR = 44100, BS = 1024;
   for (let x = 0; x < SR * 3; x++) { const v = Math.round(10000 * Math.sin(2 * Math.PI * 440 * x / SR)); s.buffers.mixL[x] = v; s.buffers.mixR[x] = v; fillInst(x, s.buffers); }
   s.buffers.mixReady.fill(1, 0, Math.ceil(SR * 3 / BS)); s.buffers.instReady.fill(1, 0, Math.ceil(SR * 3 / BS));
-  s.lastSync = { mediaTime: 0.5, playing: false, wall: Date.now(), rate: 1 };
+  // playing: the playback thread reports only while the video plays
+  s.lastSync = { mediaTime: 0.5, playing: true, wall: Date.now(), rate: 1 };
   s.setTakeover(true);
   s.silentSince = Date.now() - 2000; // the guard's 1.5 s of patience has passed
   return { s, p };
@@ -319,5 +320,25 @@ test('an attach that left before its settings applied still switches when the ne
   assert.equal(s.buffers.instReady[0], 0, "Inst HQ 5's output is not played as Inst HQ 3's");
   assert.equal(s.outputKey, s.instKey, 'the stores now hold what the settings ask for');
   s.detachController(p2);
+});
+
+// The report: paused while processing lagged, snippets kept playing until the scrubber moved.
+// The playback thread reports only while it plays, so a report under a paused video is a pause
+// that never reached it.
+test('a playback thread still playing under a paused video is paused again', async () => {
+  const engine = makeEngine();
+  const s = new Session(engine, { videoId: 'p1', duration: 10, title: 't' });
+  const p = makePort();
+  await s.attachController(p, { settings: v10 });
+  s.onSync({ type: 'sync', mediaTime: 3, wall: Date.now(), rate: 1, playing: false }); // the video is paused
+  const before = engine.player.syncs.length;
+  s.onLevel({ playing: true, hasBuffers: true, outPeak: 0.3, srcPeak: 0.3, gain: 1, envelope: 1, mixSeen: 1, instSeen: 1, mediaTime: 4.2 });
+  const sent = engine.player.syncs.slice(before);
+  assert.equal(sent.length, 1, 'one pause sent');
+  assert.equal(sent[0].playing, false);
+  assert.equal(sent[0].mediaTime, 3, 'at the position the video paused at');
+  s.onLevel({ playing: false, hasBuffers: true, outPeak: 0, srcPeak: 0, gain: 1, envelope: 0, mixSeen: 1, instSeen: 1, mediaTime: 3 });
+  assert.equal(engine.player.syncs.length, before + 1, 'nothing more once it has stopped');
+  s.detachController(p);
 });
 

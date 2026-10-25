@@ -48,9 +48,10 @@ function __cmd(o) { for (const f of (__winL['message'] || [])) f({ source: windo
 function __lastVol() { for (let i = __posted.length - 1; i >= 0; i--) if (__posted[i].t === 'vol') return __posted[i]; return null; }
 `;
 
-function world(hash) {
+function world(hash, before = '') {
   const ctx = vm.createContext({ console, setTimeout, Promise });
   vm.runInContext(PRELUDE(hash), ctx);
+  if (before) vm.runInContext(before, ctx); // what the page held before the hook ran
   vm.runInContext(HOOK, ctx);
   return {
     run: (code) => vm.runInContext(code, ctx),
@@ -142,25 +143,85 @@ test('the isolated-world content script never reports the element volume', () =>
 
 // YouTube stores the quality a player was set to in the origin's localStorage and applies it to
 // the next video from that origin. A helper on www.youtube.com shares it with the watched page.
+// YouTube stores a player's quality and volume in the origin's localStorage and applies them to
+// the next video from that origin. A helper on www.youtube.com shares that storage with the page.
+const pref = (key, data) => `localStorage.setItem('${key}', JSON.stringify({ data: JSON.stringify(${JSON.stringify(data)}), expiration: 1 }))`;
+const prefData = (w, key) => { const v = w.run(`localStorage.getItem('${key}')`); return v === null ? null : JSON.parse(JSON.parse(v).data); };
+
 test("the helper's quality request never becomes the person's saved preference", () => {
-  const w = world('#vrx-helper');
-  w.run(`
-    localStorage.setItem('yt-player-quality', 'PREF-1080');
-    __player.setPlaybackQualityRange = (a, b) => { __quality = a + '/' + b; localStorage.setItem('yt-player-quality', 'PREF-144'); };
-  `);
+  const w = world('#vrx-helper', pref('yt-player-quality', { quality: 1080 }));
+  w.run(`__player.setPlaybackQualityRange = (a, b) => { __quality = a + '/' + b; ${pref('yt-player-quality', { quality: 144, previousQuality: 1080 })}; };`);
   w.tick();
   assert.equal(w.quality(), 'tiny/tiny', 'the request itself is made');
-  assert.equal(w.run("localStorage.getItem('yt-player-quality')"), 'PREF-1080', 'and the preference is back to what it was');
-  w.run("localStorage.setItem('yt-player-quality', 'PREF-144')"); // the player writes it again later
+  assert.deepEqual(prefData(w, 'yt-player-quality'), { quality: 1080 }, 'and the preference is back to what it was');
+  w.run(pref('yt-player-quality', { quality: 144 })); // the player writes it again later
   w.tick();
-  assert.equal(w.run("localStorage.getItem('yt-player-quality')"), 'PREF-1080', 'every tick puts it back');
+  assert.deepEqual(prefData(w, 'yt-player-quality'), { quality: 1080 }, 'every tick puts it back');
+});
+
+// The earlier guard undid every change, so a quality the person chose in the page while a
+// same-origin helper ran was reverted under them.
+test("a quality the person chooses in the page meanwhile is theirs to keep", () => {
+  const w = world('#vrx-helper', pref('yt-player-quality', { quality: 1080 }));
+  w.tick();
+  w.run(pref('yt-player-quality', { quality: 720 }));
+  w.tick(3);
+  assert.deepEqual(prefData(w, 'yt-player-quality'), { quality: 720 });
 });
 
 test("a page with no saved preference is left with none", () => {
   const w = world('#vrx-helper');
-  w.run("__player.setPlaybackQualityRange = (a, b) => { __quality = a + '/' + b; localStorage.setItem('yt-player-quality', 'PREF-144'); };");
+  w.run(`__player.setPlaybackQualityRange = (a, b) => { __quality = a + '/' + b; ${pref('yt-player-quality', { quality: 144 })}; };`);
   w.tick();
   assert.equal(w.run("localStorage.getItem('yt-player-quality')"), null, 'removed, so quality stays automatic');
+});
+
+test("a muted volume the helper's player leaves in shared storage is put back; the person's own change is kept", () => {
+  const w = world('#vrx-helper', pref('yt-player-volume', { volume: 80, muted: false }));
+  w.run(pref('yt-player-volume', { volume: 80, muted: true }));
+  w.tick();
+  assert.deepEqual(prefData(w, 'yt-player-volume'), { volume: 80, muted: false });
+  w.run(pref('yt-player-volume', { volume: 35, muted: false }));
+  w.tick();
+  assert.deepEqual(prefData(w, 'yt-player-volume'), { volume: 35, muted: false });
+});
+
+// The report: with the video paused (the helper still fetching), snippets of the song played.
+// Muting the helper from its timer left gaps in which its player put the volume back.
+test('every media element in the helper is held muted at the element, whatever its player writes', () => {
+  const w = world('#vrx-helper');
+  w.tick();
+  assert.equal(w.realMuted(), true, 'muted at the element');
+  assert.equal(w.realVolume(), 0);
+  w.run('__video.muted = false; __video.volume = 1;'); // YouTube's player putting its volume back
+  assert.equal(w.realMuted(), true, 'the element stays silent');
+  assert.equal(w.realVolume(), 0);
+  assert.equal(w.run('__video.muted'), false, 'the player sees the values it wrote');
+  assert.equal(w.run('__video.volume'), 1);
+});
+
+test('a media element that starts loading or playing in the helper is silenced at once, not at the next tick', () => {
+  const w = world('#vrx-helper');
+  w.run("var __ad = new HTMLMediaElement(); __fire('loadstart', __ad);");
+  assert.equal(w.run('__ad._m'), true);
+  assert.equal(w.run('__ad._v'), 0);
+  w.run("var __b = new HTMLMediaElement(); __b._m = false; __b._v = 1; __fire('playing', __b);");
+  assert.equal(w.run('__b._m'), true);
+  w.run("Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted').set.call(__b, false);"); // unmuted behind the shadow
+  assert.equal(w.run('__b._m'), true, 'the volumechange silences it again');
+});
+
+test("the helper never uses its player's mute(), which writes the muted state to storage", () => {
+  const w = world('#vrx-helper');
+  w.tick(3);
+  assert.equal(w.run('__playerMuted'), false);
+});
+
+test('only helper frames silence their media: the watched page is untouched', () => {
+  const w = world('');
+  w.run("var __c = new HTMLMediaElement(); __fire('playing', __c);");
+  assert.equal(w.run('__c._m'), false);
+  assert.equal(w.run('__c._v'), 1);
 });
 
 // The helper is a second copy of the same video. Everything here exists to keep it from

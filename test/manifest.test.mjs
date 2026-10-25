@@ -51,6 +51,20 @@ test('the watched page guards its quality preference against the helper and repa
   assert.ok(!re.test('{"data":"{\\"quality\\":1080,\\"previousQuality\\":144}"}'), 'not a previous quality of 144');
 });
 
+// Delegating the page's autoplay permission let the hidden helper -- and any frame nested in it,
+// such as an ad's -- play with sound. Without it, muted playback still works and an attempt to
+// unmute is paused by Chrome instead of heard.
+test('the helper iframe is not given the page\'s permission to autoplay with sound', () => {
+  const start = content.slice(content.indexOf('function startHelper('), content.indexOf('async function startHelperTab('));
+  assert.doesNotMatch(start.replace(/\/\/[^\n]*/g, ''), /\.allow\s*=/);
+});
+
+test('the heartbeat reports a play state the events missed', () => {
+  const hb = content.slice(content.indexOf('function heartbeat()'), content.indexOf('function detachVideo()'));
+  assert.match(hb, /if \(playing !== S\.lastSentPlaying\) sendSync\('state'\);/);
+  assert.match(content, /S\.lastSentPlaying = isPlaying\(v\) && !S\.adShowing;/);
+});
+
 test('the helper tries the cookieless embed before anything signed in', () => {
   assert.match(content, /HELPER_STAGES = \['embed-nocookie', 'embed-iframe', 'watch-iframe', 'watch-tab'\]/);
   assert.match(content, /www\.youtube-nocookie\.com/);

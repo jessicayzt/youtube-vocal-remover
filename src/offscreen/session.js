@@ -430,6 +430,15 @@ export class Session {
   onLevel(info) {
     this.output = info;
     this.stallSeenAt = 0;
+    // The playback thread reports only while it plays. A report while the video is paused means a
+    // pause that never reached it: it was playing on past the pause point into whatever was
+    // decoded there -- snippets and fragments under a paused video. Tell it again.
+    if (info.playing && this.lastSync && !this.lastSync.playing && this.engine.active === this) {
+      console.warn('[VocalRemover] the playback thread was still playing with the video paused; pausing it');
+      this.engine.player.sync(this, { ...this.lastSync, mediaTime: this.currentPosition(), wall: Date.now(), playing: false });
+      this.silentSince = 0;
+      return;
+    }
     this.checkBufferVisibility(info);
     this.checkClock(info);
     const gate = globalThis.VRX.gate;

@@ -169,7 +169,7 @@
     adShowing: false, adObserver: null,
     engineState: null, takeover: false, heartbeat: null, videoListeners: [], preflight: null,
     pending: [], pendingBytes: 0, pendingDropped: new Set(),
-    lastPlayhead: 0, durationMismatchTicks: 0, durationRestarts: 0,
+    lastPlayhead: 0, lastSentPlaying: null, durationMismatchTicks: 0, durationRestarts: 0,
     lastPong: null, pendingVideo: null, pendingVideoTicks: 0,
     qualityPrefBefore: undefined,
   };
@@ -563,6 +563,7 @@
       playing: isPlaying(v) && !S.adShowing, ad: S.adShowing,
     });
     S.lastPlayhead = v.currentTime;
+    S.lastSentPlaying = isPlaying(v) && !S.adShowing;
   }
   function attachVideo(video) {
     detachVideo();
@@ -576,7 +577,12 @@
     S.heartbeat = setInterval(heartbeat, 500);
   }
   function heartbeat() {
-    if (S.video && isPlaying(S.video)) sendSync('tick');
+    if (S.video) {
+      // a change of play state the events did not report (a missed pause) is reported here
+      const playing = isPlaying(S.video) && !S.adShowing;
+      if (playing !== S.lastSentPlaying) sendSync('state');
+      else if (playing) sendSync('tick');
+    }
     // every kind of helper failed a while ago: try the whole ladder once more
     if (!S.helperWanted && S.captureNeeded && S.helperRetryAt && Date.now() >= S.helperRetryAt && !S.helper) { S.helperRetryAt = 0; S.helperFailures = []; log('helper: retrying after the earlier failures'); wantHelper(); }
     maybeStartHelper();
@@ -761,7 +767,10 @@
     iframe.name = 'vrx-helper';
     iframe.setAttribute('aria-hidden', 'true');
     iframe.setAttribute('tabindex', '-1');
-    iframe.allow = 'autoplay';
+    // No allow="autoplay": muted autoplay needs no permission, and without it the hidden helper
+    // (and any frame nested in it, such as an ad's) cannot play with sound -- Chrome pauses an
+    // element there that tries to unmute instead of letting it be heard. Delegating the page's
+    // permission let it be heard.
     iframe.referrerPolicy = 'strict-origin-when-cross-origin';
     // same-origin so it plays with your cookies, but no top-navigation: a frame-busting page cannot hijack this tab
     iframe.sandbox = 'allow-scripts allow-same-origin';
